@@ -1,13 +1,13 @@
 use anyhow::{Context, Result};
 use clap::{Arg, Command};
+use md5;
 use std::fs;
-
 use std::path::Path;
 use std::process::Command as ProcessCommand;
 use tempfile::NamedTempFile;
 
 fn parse_schema_dump(input_path: &str, output_dir: &str) -> std::io::Result<()> {
-    let file_content = fs::read_to_string(input_path)?;
+    let file_content = std::fs::read_to_string(input_path)?;
 
     let tokens: Vec<&str> = file_content
         .split_inclusive(|c: char| c.is_whitespace())
@@ -78,7 +78,7 @@ fn parse_schema_dump(input_path: &str, output_dir: &str) -> std::io::Result<()> 
                 let output_path = Path::new(output_dir)
                     .join(folder)
                     .join(format!("{}.sql", function_name));
-                fs::write(output_path, function_content).unwrap();
+                std::fs::write(output_path, function_content).unwrap();
                 in_function = false;
                 function_name = String::new();
                 block_label = String::new();
@@ -98,7 +98,7 @@ fn parse_schema_dump(input_path: &str, output_dir: &str) -> std::io::Result<()> 
 
     // Write the new file content without functions to a new file
     let migrations_file_path = Path::new(output_dir).join("migrations").join("00001.sql");
-    fs::write(migrations_file_path, migrations_file_content)?;
+    std::fs::write(migrations_file_path, migrations_file_content)?;
 
     Ok(())
 }
@@ -133,23 +133,149 @@ fn initialize() -> Result<()> {
     }
 
     // Create new directory "./postgres"
-    fs::create_dir_all("./postgres").context("Failed to create directory")?;
+    std::fs::create_dir_all("./postgres").context("Failed to create directory")?;
 
     // Create subfolder "./postgres/migrations"
-    fs::create_dir_all("./postgres/migrations").context("Failed to create migrations directory")?;
+    std::fs::create_dir_all("./postgres/migrations").context("Failed to create migrations directory")?;
     // Create subfolder "./postgres/triggers"
-    fs::create_dir_all("./postgres/triggers").context("Failed to create triggers directory")?;
+    std::fs::create_dir_all("./postgres/triggers").context("Failed to create triggers directory")?;
     // Create subfolder "./postgres/views"
-    fs::create_dir_all("./postgres/views").context("Failed to create views directory")?;
+    std::fs::create_dir_all("./postgres/views").context("Failed to create views directory")?;
     // Create subfolder "./postgres/functions"
-    fs::create_dir_all("./postgres/functions").context("Failed to create functions directory")?;
+    std::fs::create_dir_all("./postgres/functions").context("Failed to create functions directory")?;
 
     // Extract all functions and write them to the appropriate folder
     parse_schema_dump(&temp_path, "./postgres").context("Failed to extract functions")?;
 
     // Move tempfile to migrations folder
-    fs::rename(temp_path, "./postgres/migrations/00000.sql").context("Failed to move dump file")?;
+    std::fs::rename(temp_path, "./postgres/migrations/00000.sql").context("Failed to move dump file")?;
 
+    Ok(())
+}
+
+fn build(output: &str) -> Result<()> {
+    // Check if the postgres directory exists
+    if !Path::new("./postgres").is_dir() {
+        return Err(anyhow::anyhow!(
+            "Directory './postgres' not found. Have you run 'pgm init'?"
+        ));
+    }
+
+    let mut compiled_content = String::new();
+
+    compiled_content.push_str("DO $pgm$ BEGIN");
+    // Create tables if they don't exist
+    compiled_content.push_str(
+        r#"
+-- Create tables if they don't exist
+CREATE TABLE IF NOT EXISTS pgm_migration (
+    name TEXT PRIMARY KEY,
+    applied_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS pgm_function (
+    name TEXT PRIMARY KEY,
+    hash TEXT NOT NULL,
+    applied_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS pgm_trigger (
+    name TEXT PRIMARY KEY,
+    hash TEXT NOT NULL,
+    applied_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+"#,
+    );
+
+    // Process functions
+    process_directory(
+        "./postgres/functions",
+        "pgm_function",
+        &mut compiled_content,
+    )?;
+
+    // Process triggers
+    process_directory("./postgres/triggers", "pgm_trigger", &mut compiled_content)?;
+
+    // Process migrations
+    process_migrations(&mut compiled_content)?;
+
+    // End the single DO block
+    compiled_content.push_str("END $pgm$;\n");
+
+    // Write the compiled content to the output file
+    std::fs::write(output, compiled_content).context("Failed to write compiled file")?;
+
+    println!("Successfully compiled changes to: {}", output);
+    Ok(())
+}
+
+fn process_directory(dir: &str, table: &str, compiled_content: &mut String) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file() && path.extension().map_or(false, |ext| ext == "sql") {
+            let content = std::fs::read_to_string(&path)?;
+
+            let hash = format!("{:x}", md5::compute(&content));
+            let file_name = path.file_stem().unwrap().to_str().unwrap();
+
+            compiled_content.push_str(&format!(
+                "-- RUN {dir}/{file_name}.sql --
+IF (SELECT hash FROM {table} WHERE name = '{file_name}') IS DISTINCT FROM '{hash}' THEN
+{content}
+
+    INSERT INTO {table} (name, hash) 
+    VALUES ('{file_name}', '{hash}')
+    ON CONFLICT (name) 
+    DO UPDATE SET hash = EXCLUDED.hash, applied_at = CURRENT_TIMESTAMP;
+    
+    RAISE NOTICE 'Applied {dir}/{file_name}.sql';
+ELSE
+    RAISE NOTICE 'Skipped {dir}/{file_name}.sql (no changes)';
+END IF;
+-- DONE {dir}/{file_name}.sql --
+
+"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn process_migrations(compiled_content: &mut String) -> Result<()> {
+    let migrations_dir = "./postgres/migrations";
+    let mut migration_files: Vec<_> = std::fs::read_dir(migrations_dir)?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry.path().is_file() && entry.path().extension().map_or(false, |ext| ext == "sql")
+        })
+        .collect();
+
+    migration_files.sort_by_key(|entry| entry.file_name());
+
+    for entry in migration_files {
+        let path = entry.path();
+        let content = std::fs::read_to_string(&path)?;
+
+        let file_name = path.file_stem().unwrap().to_str().unwrap();
+
+        compiled_content.push_str(&format!(
+            "-- RUN {migrations_dir}/{file_name}.sql --
+IF NOT EXISTS (SELECT 1 FROM pgm_migration WHERE name = '{file_name}') THEN
+{content}
+
+INSERT INTO pgm_migration (name) VALUES ('{file_name}');
+RAISE NOTICE 'Applied migration: {file_name}';
+ELSE
+RAISE NOTICE 'Skipped migration: {file_name} (already applied)';
+END IF;
+-- DONE {migrations_dir}/{file_name}.sql --
+
+"
+        ));
+    }
     Ok(())
 }
 
@@ -212,7 +338,7 @@ fn main() {
                 .arg(
                     Arg::new("output")
                         .help("The output file path")
-                        .default_value("migration.sql")
+                        .default_value("postgres/output.sql")
                         .value_parser(clap::value_parser!(String)),
                 ),
         )
@@ -270,8 +396,9 @@ fn main() {
             let output = build_matches
                 .get_one::<String>("output")
                 .expect("Output argument is required");
-            println!("Compiling changes to: {}", output);
-            todo!("build command logic");
+            if let Err(e) = build(output) {
+                eprintln!("Error during build: {}", e);
+            }
         }
         _ => {}
     }
