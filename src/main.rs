@@ -86,6 +86,19 @@ fn parse_schema_dump(schema_dump: &String, output_dir: &str) -> std::io::Result<
         }
     }
 
+    // Remove all lines starting with -- and other unnecessary lines
+    let migrations_file_content = migrations_file_content
+    .lines()
+    .filter(|line| !line.starts_with("--"))
+    .filter(|line| !line.starts_with("SELECT pg_catalog.set_config('search_path'"))
+    .filter(|line| !line.is_empty())
+    .collect::<Vec<&str>>()
+    .join("\n");
+
+    // Write the new file content without functions to a new file
+    let migrations_file_path = Path::new("./postgres").join("migrations").join("00000.sql");
+    std::fs::write(migrations_file_path, migrations_file_content)?;
+
     Ok(())
 }
 
@@ -95,62 +108,14 @@ fn initialize() -> Result<()> {
         return Err(anyhow::anyhow!("Directory 'postgres' already exists"));
     }
 
-    // Create temporary files for pre-data and post-data dumps
-    let pre_data_file =
-        NamedTempFile::new().context("Failed to create temporary file for pre-data dump")?;
-    let post_data_file =
-        NamedTempFile::new().context("Failed to create temporary file for post-data dump")?;
+    // Create temporary file for schema dump
+    let schema_dump_file =
+        NamedTempFile::new().context("Failed to create temporary file for schema dump")?;
 
-    // Call pg_dump to get pre-data dump
-    run_pg_dump("--section=pre-data", pre_data_file.path().to_str().unwrap())?;
-
-    // Call pg_dump to get post-data dump
-    run_pg_dump(
-        "--section=post-data",
-        post_data_file.path().to_str().unwrap(),
-    )?;
-
-    // Concatenate pre-data and post-data dumps
-    let mut combined_dump = String::new();
-    let pre_data = std::fs::read_to_string(pre_data_file.path().to_str().unwrap()).expect("why");
-    let post_data = std::fs::read_to_string(post_data_file.path().to_str().unwrap()).expect("why");
-    combined_dump.push_str(&pre_data);
-    combined_dump.push_str(&post_data);
-
-    // Create new directory "./postgres" and subdirectories
-    std::fs::create_dir_all("./postgres").context("Failed to create directory")?;
-    std::fs::create_dir_all("./postgres/migrations")
-        .context("Failed to create migrations directory")?;
-    std::fs::create_dir_all("./postgres/triggers")
-        .context("Failed to create triggers directory")?;
-    std::fs::create_dir_all("./postgres/views").context("Failed to create views directory")?;
-    std::fs::create_dir_all("./postgres/functions")
-        .context("Failed to create functions directory")?;
-
-    // Extract all functions and triggers from combined dump and write them to the appropriate folders
-    // Then create a migration file with the changes
-    parse_schema_dump(&combined_dump, "./postgres")
-        .context("Failed to extract functions and triggers")?;
-
-    // Remove all lines starting with --
-    let migrations_file_content = combined_dump
-        .lines()
-        .filter(|line| !line.starts_with("--"))
-        .filter(|line| !line.starts_with("SELECT pg_catalog.set_config('search_path'"))
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<&str>>()
-        .join("\n");
-
-    // Write the new file content without functions to a new file
-    let migrations_file_path = Path::new("./postgres").join("migrations").join("00001.sql");
-    std::fs::write(migrations_file_path, migrations_file_content)?;
-
-    Ok(())
-}
-
-fn run_pg_dump(section: &str, output_path: &str) -> Result<()> {
+    // Call pg_dump to get schema-only dump
+    let output_path = schema_dump_file.path().to_str().unwrap();
     let mut child = match ProcessCommand::new("pg_dump")
-        .args(&["-f", output_path, "--schema-only", "--no-owner", section])
+        .args(&["-f", output_path, "--no-owner", "--schema-only"])
         .spawn()
     {
         Ok(child) => child,
@@ -167,6 +132,24 @@ fn run_pg_dump(section: &str, output_path: &str) -> Result<()> {
         return Err(anyhow::anyhow!("pg_dump failed"));
     }
 
+    // Read the schema dump
+    let schema_dump = std::fs::read_to_string(output_path)?;
+
+    // Create new directory "./postgres" and subdirectories
+    std::fs::create_dir_all("./postgres").context("Failed to create directory")?;
+    std::fs::create_dir_all("./postgres/migrations")
+        .context("Failed to create migrations directory")?;
+    std::fs::create_dir_all("./postgres/triggers")
+        .context("Failed to create triggers directory")?;
+    std::fs::create_dir_all("./postgres/views").context("Failed to create views directory")?;
+    std::fs::create_dir_all("./postgres/functions")
+        .context("Failed to create functions directory")?;
+
+    // Extract all functions and triggers from schema dump and write them to the appropriate folders
+    // Then create a migration file with the changes
+    parse_schema_dump(&schema_dump, "./postgres")
+        .context("Failed to extract functions and triggers")?;
+
     Ok(())
 }
 
@@ -181,7 +164,8 @@ fn build(output: &str) -> Result<()> {
     let mut compiled_content = String::new();
 
     // Start the main DO block
-    compiled_content.push_str("DO $pgm$ BEGIN");
+    compiled_content.push_str("DO $pgm$ BEGIN\n");
+    compiled_content.push_str("SET LOCAL check_function_bodies = false;\n");
     // Create tables if they don't exist
     compiled_content.push_str(
         r#"
@@ -206,8 +190,6 @@ CREATE TABLE IF NOT EXISTS pgm_trigger (
 "#,
     );
 
-    // Process migrations
-    process_migrations(&mut compiled_content)?;
 
     // Process functions
     process_directory(
@@ -218,6 +200,9 @@ CREATE TABLE IF NOT EXISTS pgm_trigger (
 
     // Process triggers
     process_directory("./postgres/triggers", "pgm_trigger", &mut compiled_content)?;
+
+    // Process migrations
+    process_migrations(&mut compiled_content)?;
 
     // End the main DO block
     compiled_content.push_str("END $pgm$;\n");
@@ -296,39 +281,37 @@ END IF;
     Ok(())
 }
 
-fn apply(input_file: &str, db_url: &str) -> Result<()> {
+fn apply(input_file: &str) -> Result<()> {
     // Read the compiled SQL
     let sql = std::fs::read_to_string(input_file).context("Failed to read compiled SQL file")?;
 
-    // Connect to the database using the provided URL
-    let mut conn = postgres::Client::connect(db_url, postgres::NoTls)
-        .context("Failed to connect to the database")?;
+    // Create a temporary file to store the SQL
+    let mut temp_file = NamedTempFile::new().context("Failed to create temporary file")?;
+    temp_file.write_all(sql.as_bytes()).context("Failed to write SQL to temporary file")?;
 
-    match conn.batch_execute(&sql) {
-        Ok(_) => return Ok(()),
-        Err(e) => {
-            let mut error_message = format!("{}", e);
+    // Construct the psql command
+    let mut command = ProcessCommand::new("psql");
+    command.arg("-f")
+           .arg(temp_file.path())
+           .arg("-v")
+           .arg("ON_ERROR_STOP=1");
 
-            if let Some(db_error) = e.as_db_error() {
-                if let Some(where_) = db_error.where_() {
-                    error_message.push_str(&format!("\nWhere: {}", where_));
-                }
-                if let Some(hint) = db_error.hint() {
-                    error_message.push_str(&format!("\nHint: {}", hint));
-                }
-                if let Some(detail) = db_error.detail() {
-                    error_message.push_str(&format!("\nDetail: {}", detail));
-                }
-                if let Some(position) = db_error.position() {
-                    error_message.push_str(&format!("\nPosition: {:?}", position));
-                }
-            }
-            return Err(anyhow::anyhow!(error_message));
-        }
+    // Execute the psql command
+    let output = command.output().context("Failed to execute psql command")?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let error_message = String::from_utf8_lossy(&output.stderr);
+        Err(anyhow::anyhow!("Error applying changes: {}", error_message))
     }
 }
 
 fn create_function(name: &str) -> Result<()> {
+    if !Path::new("./postgres").exists() {
+        return Err(anyhow::anyhow!("Directory './postgres' not found. Have you run 'pgm init'?"));
+    }
+
     let path = Path::new("./postgres/functions").join(format!("{}.sql", name));
     std::fs::create_dir_all("./postgres/functions")
         .context("Failed to create functions directory")?;
@@ -359,6 +342,10 @@ fn create_function(name: &str) -> Result<()> {
 }
 
 fn create_migration() -> Result<()> {
+    if !Path::new("./postgres").exists() {
+        return Err(anyhow::anyhow!("Directory './postgres' not found. Have you run 'pgm init'?"));
+    }
+
     let migrations_dir = "./postgres/migrations";
     let last_migration_file = std::fs::read_dir(migrations_dir)?
         .filter_map(|entry| entry.ok())
@@ -379,6 +366,10 @@ fn create_migration() -> Result<()> {
 }
 
 fn create_trigger(name: &str) -> Result<()> {
+    if !Path::new("./postgres").exists() {
+        return Err(anyhow::anyhow!("Directory './postgres' not found. Have you run 'pgm init'?"));
+    }
+
     let path = Path::new("./postgres/triggers").join(format!("{}.sql", name));
     std::fs::create_dir_all("./postgres/triggers")
         .context("Failed to create triggers directory")?;
@@ -423,13 +414,6 @@ fn main() {
                     Arg::new("input-file")
                         .help("The input file path to apply")
                         .default_value("postgres/output.sql")
-                        .value_parser(clap::value_parser!(String)),
-                )
-                .arg(
-                    Arg::new("url")
-                        .long("url")
-                        .help("The database connection URL")
-                        .required(true)
                         .value_parser(clap::value_parser!(String)),
                 ),
         )
@@ -498,10 +482,7 @@ fn main() {
             let input_file = apply_matches
                 .get_one::<String>("input-file")
                 .expect("Input argument is required");
-            let db_url = apply_matches
-                .get_one::<String>("url")
-                .expect("URL argument is required");
-            match apply(input_file, db_url) {
+            match apply(input_file) {
                 Ok(_) => println!("Changes applied successfully"),
                 Err(e) => eprintln!("Error applying changes: {}", e),
             }
