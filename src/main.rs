@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Arg, Command};
 use md5;
+use std::io::{self, Write};
 use std::path::Path;
 use std::process::Command as ProcessCommand;
 use tempfile::NamedTempFile;
@@ -327,9 +328,40 @@ fn apply(input_file: &str, db_url: &str) -> Result<()> {
     }
 }
 
+fn create_function(name: &str) -> Result<()> {
+    let path = Path::new("./postgres/functions").join(format!("{}.sql", name));
+    std::fs::create_dir_all("./postgres/functions")
+        .context("Failed to create functions directory")?;
+
+    if path.exists() {
+        print!(
+            "Function '{}' already exists. Do you want to reset it? (y/N): ",
+            name
+        );
+        io::stdout().flush().unwrap();
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).unwrap();
+
+        if !input.trim().eq_ignore_ascii_case("y") {
+            println!("Function creation aborted.");
+            return Ok(());
+        }
+    }
+
+    let template = std::fs::read_to_string("./src/templates/function.sql")
+        .context("Failed to read function template")?;
+    let content = template.replace("{{name}}", name);
+    std::fs::write(path, content).context("Failed to create function file")?;
+
+    println!("Function '{}' created successfully", name);
+    Ok(())
+}
+
 fn main() {
     let matches = Command::new("pgm")
         .version("0.1")
+        .arg_required_else_help(true)
         .about(
             "A CLI tool for managing postgres database migrations, triggers, views and functions",
         )
@@ -449,8 +481,10 @@ fn main() {
                 let name = function_matches
                     .get_one::<String>("name")
                     .expect("Name argument is required");
-                println!("Creating a new function: {}", name);
-                todo!("create function command logic");
+
+                if let Err(e) = create_function(name) {
+                    eprintln!("Error during function creation: {}", e);
+                }
             }
             _ => {}
         },
