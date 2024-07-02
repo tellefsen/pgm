@@ -358,6 +358,56 @@ fn create_function(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn create_migration() -> Result<()> {
+    let migrations_dir = "./postgres/migrations";
+    let last_migration_file = std::fs::read_dir(migrations_dir)?
+        .filter_map(|entry| entry.ok())
+        .max_by_key(|entry| entry.file_name());
+    let last_migration_number = last_migration_file
+        .map_or(0, |entry| {
+            entry.file_name()
+                .to_str()
+                .and_then(|s| s.split('.').next())
+                .and_then(|s| s.parse::<i32>().ok())
+                .unwrap_or(0)
+        });
+    let next_migration_number = format!("{:05}", last_migration_number + 1);
+    let next_migration_file = format!("{}/{}.sql", migrations_dir, next_migration_number);
+    std::fs::create_dir_all(migrations_dir).context("Failed to create migrations directory")?;
+    std::fs::write(next_migration_file, "").context("Failed to create migration file")?;
+    Ok(())
+}
+
+fn create_trigger(name: &str) -> Result<()> {
+    let path = Path::new("./postgres/triggers").join(format!("{}.sql", name));
+    std::fs::create_dir_all("./postgres/triggers")
+        .context("Failed to create triggers directory")?;
+
+    if path.exists() {
+        print!(
+            "Trigger '{}' already exists. Do you want to reset it? (y/N): ",
+            name
+        );
+        io::stdout().flush().unwrap();
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).unwrap();
+
+        if !input.trim().eq_ignore_ascii_case("y") {
+            println!("Trigger creation aborted.");
+            return Ok(());
+        }
+    }
+
+    let template = std::fs::read_to_string("./src/templates/trigger_function.sql")
+        .context("Failed to read trigger template")?;
+    let content = template.replace("{{name}}", name);
+    std::fs::write(path, content).context("Failed to create trigger file")?;
+
+    println!("Trigger '{}' created successfully", name);
+    Ok(())
+}
+
 fn main() {
     let matches = Command::new("pgm")
         .version("0.1")
@@ -389,12 +439,14 @@ fn main() {
                 .subcommand_required(true)
                 .subcommand(Command::new("migration").about("Creates a new migration"))
                 .subcommand(
-                    Command::new("trigger").about("Creates a new trigger").arg(
-                        Arg::new("name")
-                            .help("The name of the trigger")
-                            .required(true)
-                            .value_parser(clap::value_parser!(String)),
-                    ),
+                    Command::new("trigger")
+                        .about("Creates a new trigger")
+                        .arg(
+                            Arg::new("name")
+                                .help("The name of the trigger")
+                                .required(true)
+                                .value_parser(clap::value_parser!(String)),
+                        ),
                 )
                 .subcommand(
                     Command::new("view")
@@ -456,15 +508,19 @@ fn main() {
         }
         Some(("create", create_matches)) => match create_matches.subcommand() {
             Some(("migration", _)) => {
-                println!("Creating a new migration");
-                todo!("create migration command logic");
+                if let Err(e) = create_migration() {
+                    eprintln!("Error during migration creation: {}", e);
+                } else {
+                    println!("Migration created successfully");
+                }
             }
             Some(("trigger", trigger_matches)) => {
                 let name = trigger_matches
                     .get_one::<String>("name")
                     .expect("Name argument is required");
-                println!("Creating a new trigger: {}", name);
-                todo!("create trigger command logic");
+                if let Err(e) = create_trigger(name) {
+                    eprintln!("Error during trigger creation: {}", e);
+                }
             }
             Some(("view", view_matches)) => {
                 let name = view_matches
