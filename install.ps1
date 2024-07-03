@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Stop'
 
 # GitHub release URL
-$releaseUrl = "https://github.com/tellfesen/pgm/releases/latest/download/pgm-windows.exe"
+$releaseUrl = "https://github.com/tellefsen/pgm/releases/latest/download/pgm-windows.exe"
 
 # Download the binary
 Write-Host "Downloading pgm..."
