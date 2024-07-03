@@ -103,6 +103,29 @@ For a dry run:
 PGDATABASE=mydb pgm apply --dry-run
 ```
 
+### Fake Apply Changes
+
+```
+pgm apply --fake [--path <path>]
+```
+
+The `--fake` option allows you to update the pgm tracking tables without actually executing the SQL content of your migrations, functions, triggers, and views. This is particularly useful when migrating an existing database to use pgm:
+
+- You can mark all existing objects as applied without modifying the database.
+- This allows you to start using pgm with an existing database schema without re-running all the migrations.
+
+When using `--fake`:
+- pgm will update the `pgm_migration`, `pgm_function`, `pgm_trigger`, and `pgm_view` tables.
+- The actual SQL content of your database objects will not be executed.
+- pgm will log which objects were "fake applied".
+
+Example:
+```
+PGDATABASE=mydb pgm apply --fake
+```
+
+Note: Use the `--fake` option with caution, especially on production databases, as it can lead to discrepancies between the actual database state and what pgm thinks has been applied.
+
 ### Create new elements
 
 #### Create a migration

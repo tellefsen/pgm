@@ -302,7 +302,7 @@ fn process_migrations(pgm_dir_path: &str) -> Result<String> {
 
         compiled_content.push_str(&format!(
             "-- RUN {file_path} --
-IF NOT EXISTS (SELECT 1 FROM pgm_migration WHERE name = '{file_name}') THEN
+IF NOT EXISTS (SELECT 1 FROM pgm_migration WHERE name = '{file_path}') THEN
 {content}
 
 INSERT INTO pgm_migration (name) VALUES ('{file_path}');
@@ -318,15 +318,104 @@ END IF;
     Ok(compiled_content)
 }
 
-fn apply(pgm_dir_path: &str, dry_run: bool) -> Result<()> {
-    // Compile the SQL
-    let sql = build(pgm_dir_path).expect("Failed to compile SQL");
+fn build_fake(pgm_dir_path: &str) -> Result<String> {
+    // Check if the postgres directory exists
+    if !Path::new(pgm_dir_path).is_dir() {
+        return Err(anyhow::anyhow!(
+            "Directory '{}' not found. Have you run 'pgm init'?",
+            pgm_dir_path
+        ));
+    }
 
+    let mut compiled_content = String::new();
+
+    // Start the main DO block
+    compiled_content.push_str("DO $pgm$ BEGIN\n");
+
+    let functions_content =
+        process_directory_fake(&format!("{}/functions", pgm_dir_path), "pgm_function")?;
+    let triggers_content =
+        process_directory_fake(&format!("{}/triggers", pgm_dir_path), "pgm_trigger")?;
+    let views_content = process_directory_fake(&format!("{}/views", pgm_dir_path), "pgm_view")?;
+    let migrations_content = process_migrations_fake(pgm_dir_path)?;
+
+    // Process directories and migrations, but only update pgm_ tables
+    compiled_content.push_str(&functions_content);
+    compiled_content.push_str(&triggers_content);
+    compiled_content.push_str(&views_content);
+    compiled_content.push_str(&migrations_content);
+
+    // End the main DO block
+    compiled_content.push_str("END $pgm$;\n");
+
+    Ok(compiled_content)
+}
+
+fn process_directory_fake(full_dir_path: &str, table: &str) -> Result<String> {
+    let mut compiled_content = String::new();
+    for entry in std::fs::read_dir(full_dir_path)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file() && path.extension().map_or(false, |ext| ext == "sql") {
+            let content = std::fs::read_to_string(&path)?;
+            let hash = format!("{:x}", md5::compute(&content));
+            let file_name = path.file_stem().unwrap().to_str().unwrap();
+
+            compiled_content.push_str(&format!(
+                "-- Fake apply {table} '{file_name}'
+INSERT INTO {table} (name, hash) VALUES ('{file_name}', '{hash}') 
+                ON CONFLICT (name) DO UPDATE SET hash = EXCLUDED.hash, applied_at = CURRENT_TIMESTAMP;
+                RAISE NOTICE 'Fake applied: {table} - {file_name}';\n"
+            ));
+        }
+    }
+    Ok(compiled_content)
+}
+
+fn process_migrations_fake(pgm_dir_path: &str) -> Result<String> {
+    let migrations_dir = format!("{}/migrations", pgm_dir_path);
+    let migrations_dir = migrations_dir.as_str();
+    let mut migration_files: Vec<_> = std::fs::read_dir(migrations_dir)?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry.path().is_file() && entry.path().extension().map_or(false, |ext| ext == "sql")
+        })
+        .collect();
+
+    // Sort the migration files
+    migration_files.sort_by_key(|entry| entry.file_name());
+
+    let mut compiled_content = String::new();
+    for entry in migration_files {
+        let path = entry.path();
+        let file_name = path.file_stem().unwrap().to_str().unwrap();
+        compiled_content.push_str(&format!(
+            "-- Fake apply migration '{file_name}'
+INSERT INTO pgm_migration (name) VALUES ('{file_name}') ON CONFLICT (name) DO NOTHING;
+            RAISE NOTICE 'Fake applied migration: {file_name}';\n"
+        ));
+    }
+    Ok(compiled_content)
+}
+
+fn apply(pgm_dir_path: &str, dry_run: bool, fake: bool) -> Result<()> {
+    // Compile the SQL
+    let sql = if fake {
+        build_fake(pgm_dir_path).expect("Failed to compile fake SQL")
+    } else {
+        build(pgm_dir_path).expect("Failed to compile SQL")
+    };
+
+    // Print the SQL and exit if dry-run
     if dry_run {
         println!("{}", sql);
         return Ok(());
+    } else {
+        execute_sql(&sql)
     }
+}
 
+fn execute_sql(sql: &str) -> Result<()> {
     // Check if psql exists
     if !ProcessCommand::new("psql")
         .arg("--version")
@@ -568,6 +657,12 @@ fn main() {
                         .long("dry-run")
                         .help("Prints the SQL that would be applied but does not apply it")
                         .action(clap::ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("fake")
+                        .long("fake")
+                        .help("Only updates pgm_ tables without executing the actual SQL")
+                        .action(clap::ArgAction::SetTrue),
                 ),
         )
         .subcommand(
@@ -671,11 +766,10 @@ fn main() {
             let path = apply_matches
                 .get_one::<String>("path")
                 .expect("Input argument is required");
-            let dry_run = *apply_matches
-                .get_one::<bool>("dry-run")
-                .expect("Default value should always be present");
+            let dry_run = apply_matches.get_flag("dry-run");
+            let fake = apply_matches.get_flag("fake");
 
-            match apply(path, dry_run) {
+            match apply(path, dry_run, fake) {
                 Ok(_) => {
                     if !dry_run {
                         println!("Changes applied successfully");
