@@ -12,7 +12,19 @@ pgm is a command-line tool used to manage PostgreSQL migrations, functions, trig
 
 ## Installation
 
-[Add installation instructions here]
+### For macOS and Linux:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/tellefsen/pgm/main/install.sh | bash
+```
+
+### For Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/tellefsen/pgm/main/install.ps1 | iex
+```
+
+These commands will download and run a script that installs the appropriate pre-compiled binary for your system.
 
 ## Requirements
 
@@ -151,10 +163,7 @@ postgres/
 
 pgm manages your database schema by tracking changes in SQL files. It detects changes and applies only the necessary updates to your database.
 
-## Technical Information
-
 pgm applies changes to the database in a specific order to ensure dependencies are met and to maintain consistency:
-
 1. Functions: Applied first as they may be required by triggers, views, or migrations.
 2. Triggers: Applied second as they often depend on functions but should be in place before data changes.
 3. Migrations: Applied third to handle schema changes and data modifications.
