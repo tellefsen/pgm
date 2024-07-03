@@ -105,7 +105,7 @@ fn parse_schema_dump(pgm_dir_path: &str, schema_dump: &String) -> std::io::Resul
     Ok(())
 }
 
-fn initialize(pgm_dir_path: &str) -> Result<()> {
+fn initialize(pgm_dir_path: &str, existing_db: bool) -> Result<()> {
     if Path::new(pgm_dir_path).exists() {
         return Err(anyhow::anyhow!(
             "Directory '{}' already exists",
@@ -113,34 +113,50 @@ fn initialize(pgm_dir_path: &str) -> Result<()> {
         ));
     }
 
-    // Create temporary file for schema dump
-    let schema_dump_file =
-        NamedTempFile::new().context("Failed to create temporary file for schema dump")?;
+    if existing_db {
+        // Create temporary file for schema dump
+        let schema_dump_file =
+            NamedTempFile::new().context("Failed to create temporary file for schema dump")?;
 
-    // Call pg_dump to get schema-only dump
-    let output_path = schema_dump_file.path().to_str().unwrap();
-    let mut child = match ProcessCommand::new("pg_dump")
-        .args(&["-f", output_path, "--no-owner", "--schema-only"])
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(anyhow::anyhow!(
-                "pg_dump not found. Please ensure it is installed and in your PATH."
-            ));
+        // Call pg_dump to get schema-only dump
+        let output_path = schema_dump_file.path().to_str().unwrap();
+        let mut child = match ProcessCommand::new("pg_dump")
+            .args(&["-f", output_path, "--no-owner", "--schema-only"])
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(anyhow::anyhow!(
+                    "pg_dump not found. Please ensure it is installed and in your PATH."
+                ));
+            }
+            Err(e) => return Err(anyhow::anyhow!("Failed to spawn pg_dump: {}", e)),
+        };
+
+        let exit_status = child.wait().context("Failed to wait for pg_dump")?;
+        if !exit_status.success() {
+            return Err(anyhow::anyhow!("pg_dump failed"));
         }
-        Err(e) => return Err(anyhow::anyhow!("Failed to spawn pg_dump: {}", e)),
-    };
 
-    let exit_status = child.wait().context("Failed to wait for pg_dump")?;
-    if !exit_status.success() {
-        return Err(anyhow::anyhow!("pg_dump failed"));
+        // Read the schema dump
+        let schema_dump = std::fs::read_to_string(output_path)?;
+
+        // Create directory structure
+        create_directory_structure(pgm_dir_path)?;
+
+        // Extract all functions and triggers from schema dump and write them to the appropriate folders
+        // Then create a migration file with the changes
+        parse_schema_dump(pgm_dir_path, &schema_dump)
+            .context("Failed to extract functions and triggers")?;
+    } else {
+        // Create directory structure without using pg_dump
+        create_directory_structure(pgm_dir_path)?;
     }
 
-    // Read the schema dump
-    let schema_dump = std::fs::read_to_string(output_path)?;
+    Ok(())
+}
 
-    // Create new directory "./postgres" and subdirectories
+fn create_directory_structure(pgm_dir_path: &str) -> Result<()> {
     std::fs::create_dir_all(pgm_dir_path).context("Failed to create directory")?;
     std::fs::create_dir_all(format!("{}/migrations", pgm_dir_path))
         .context("Failed to create migrations directory")?;
@@ -150,12 +166,6 @@ fn initialize(pgm_dir_path: &str) -> Result<()> {
         .context("Failed to create views directory")?;
     std::fs::create_dir_all(format!("{}/functions", pgm_dir_path))
         .context("Failed to create functions directory")?;
-
-    // Extract all functions and triggers from schema dump and write them to the appropriate folders
-    // Then create a migration file with the changes
-    parse_schema_dump(pgm_dir_path, &schema_dump)
-        .context("Failed to extract functions and triggers")?;
-
     Ok(())
 }
 
@@ -221,7 +231,6 @@ CREATE TABLE IF NOT EXISTS pgm_view (
     compiled_content.push_str("SET LOCAL check_function_bodies = true;\n");
     compiled_content.push_str(&process_directory(&functions_dir, "pgm_function", true)?);
     compiled_content.push_str(&process_directory(&triggers_dir, "pgm_trigger", true)?);
-
 
     // End the main DO block
     compiled_content.push_str("END $pgm$;\n");
@@ -529,12 +538,20 @@ fn main() {
             "A CLI tool for managing postgres database migrations, triggers, views and functions",
         )
         .subcommand(
-            Command::new("init").about("Initializes the directory").arg(
-                Arg::new("path")
-                    .help("The path to the directory containing the database files")
-                    .default_value(DEFAULT_PGM_PATH)
-                    .value_parser(clap::value_parser!(String)),
-            ),
+            Command::new("init")
+                .about("Initializes the directory")
+                .arg(
+                    Arg::new("path")
+                        .help("The path to the directory where pgm will store its files")
+                        .default_value(DEFAULT_PGM_PATH)
+                        .value_parser(clap::value_parser!(String)),
+                )
+                .arg(
+                    Arg::new("existing-db")
+                        .long("existing-db")
+                        .help("Initialize from an existing database using pg_dump")
+                        .action(clap::ArgAction::SetTrue),
+                ),
         )
         .subcommand(
             Command::new("apply")
@@ -643,7 +660,8 @@ fn main() {
             let path = init_matches
                 .get_one::<String>("path")
                 .expect("Input argument is required");
-            if let Err(e) = initialize(path) {
+            let existing_db = init_matches.get_flag("existing-db");
+            if let Err(e) = initialize(path, existing_db) {
                 eprintln!("Error during initialization: {}", e);
             } else {
                 println!("Initialized successfully");
