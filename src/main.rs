@@ -92,6 +92,7 @@ fn parse_schema_dump(pgm_dir_path: &str, schema_dump: &String) -> std::io::Resul
     let migrations_file_content = migrations_file_content
         .lines()
         .filter(|line| !line.starts_with("--"))
+        .filter(|line| !line.starts_with("SET check_function_bodies = false"))
         .filter(|line| !line.starts_with("SELECT pg_catalog.set_config('search_path'"))
         .filter(|line| !line.is_empty())
         .collect::<Vec<&str>>()
@@ -172,7 +173,8 @@ fn build(pgm_dir_path: &str) -> Result<String> {
     // Start the main DO block
     compiled_content.push_str("DO $pgm$ BEGIN\n");
     compiled_content.push_str("SET LOCAL check_function_bodies = false;\n");
-    // Create tables if they don't exist
+
+    // Add schema creation with existence check
     compiled_content.push_str(
         r#"
 -- Create tables if they don't exist
@@ -193,32 +195,33 @@ CREATE TABLE IF NOT EXISTS pgm_trigger (
     applied_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS pgm_view (
+    name TEXT PRIMARY KEY,
+    hash TEXT NOT NULL,
+    applied_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
 "#,
     );
 
-    // Process functions
-    process_directory(
-        &format!("{}/functions", pgm_dir_path),
-        "pgm_function",
-        &mut compiled_content,
-    )?;
+    let functions_dir = format!("{}/functions", pgm_dir_path);
+    let triggers_dir = format!("{}/triggers", pgm_dir_path);
+    let views_dir = format!("{}/views", pgm_dir_path);
 
-    // Process triggers
-    process_directory(
-        &format!("{}/triggers", pgm_dir_path),
-        "pgm_trigger",
-        &mut compiled_content,
-    )?;
+    // Add all the content to the compiled SQL file, the hash is not updated here because we will update it below (where we also check the function body)
+    compiled_content.push_str(&process_directory(&functions_dir, "pgm_function", false)?);
+    compiled_content.push_str(&process_directory(&triggers_dir, "pgm_trigger", false)?);
 
-    // Process views
-    process_directory(
-        &format!("{}/views", pgm_dir_path),
-        "pgm_view",
-        &mut compiled_content,
-    )?;
+    // Add the migrations and views
+    compiled_content.push_str(&process_migrations(pgm_dir_path)?);
+    compiled_content.push_str(&process_directory(&views_dir, "pgm_view", true)?);
 
-    // Process migrations
-    process_migrations(pgm_dir_path, &mut compiled_content)?;
+    // At this point we already know that tables/functions/triggers/views are created
+    // However we must check the function bodies (since the check was turned off above)
+    compiled_content.push_str("SET LOCAL check_function_bodies = true;\n");
+    compiled_content.push_str(&process_directory(&functions_dir, "pgm_function", true)?);
+    compiled_content.push_str(&process_directory(&triggers_dir, "pgm_trigger", true)?);
+
 
     // End the main DO block
     compiled_content.push_str("END $pgm$;\n");
@@ -226,11 +229,8 @@ CREATE TABLE IF NOT EXISTS pgm_trigger (
     Ok(compiled_content)
 }
 
-fn process_directory(
-    full_dir_path: &str,
-    table: &str,
-    compiled_content: &mut String,
-) -> Result<()> {
+fn process_directory(full_dir_path: &str, table: &str, update_table_hash: bool) -> Result<String> {
+    let mut compiled_content = String::new();
     for entry in std::fs::read_dir(full_dir_path)? {
         let entry = entry?;
         let path = entry.path();
@@ -242,16 +242,21 @@ fn process_directory(
 
             let file_path = format!("{}/{}", full_dir_path, file_name);
 
+            let update_hash_query = if update_table_hash {
+                format!(
+                    "INSERT INTO {table} (name, hash) VALUES ('{file_name}', '{hash}') ON CONFLICT (name) DO UPDATE SET hash = EXCLUDED.hash, applied_at = CURRENT_TIMESTAMP;"
+                )
+            } else {
+                String::new()
+            };
+
             compiled_content.push_str(&format!(
                 "-- RUN {file_path} --
 IF (SELECT hash FROM {table} WHERE name = '{file_name}') IS DISTINCT FROM '{hash}' THEN
 {content}
 
-    INSERT INTO {table} (name, hash) 
-    VALUES ('{file_name}', '{hash}')
-    ON CONFLICT (name) 
-    DO UPDATE SET hash = EXCLUDED.hash, applied_at = CURRENT_TIMESTAMP;
-    
+{update_hash_query}
+
     RAISE NOTICE 'Applied {file_path}';
 ELSE
     RAISE NOTICE 'Skipped {file_path} (no changes)';
@@ -262,10 +267,10 @@ END IF;
             ));
         }
     }
-    Ok(())
+    Ok(compiled_content)
 }
 
-fn process_migrations(pgm_dir_path: &str, compiled_content: &mut String) -> Result<()> {
+fn process_migrations(pgm_dir_path: &str) -> Result<String> {
     let migrations_dir = format!("{}/migrations", pgm_dir_path);
     let migrations_dir = migrations_dir.as_str();
     let mut migration_files: Vec<_> = std::fs::read_dir(migrations_dir)?
@@ -277,6 +282,7 @@ fn process_migrations(pgm_dir_path: &str, compiled_content: &mut String) -> Resu
 
     migration_files.sort_by_key(|entry| entry.file_name());
 
+    let mut compiled_content = String::new();
     for entry in migration_files {
         let path = entry.path();
         let content = std::fs::read_to_string(&path)?;
@@ -287,7 +293,7 @@ fn process_migrations(pgm_dir_path: &str, compiled_content: &mut String) -> Resu
 
         compiled_content.push_str(&format!(
             "-- RUN {file_path} --
-IF NOT EXISTS (SELECT 1 FROM pgm_migration WHERE name = '{file_path}') THEN
+IF NOT EXISTS (SELECT 1 FROM pgm_migration WHERE name = '{file_name}') THEN
 {content}
 
 INSERT INTO pgm_migration (name) VALUES ('{file_path}');
@@ -300,7 +306,7 @@ END IF;
 "
         ));
     }
-    Ok(())
+    Ok(compiled_content)
 }
 
 fn apply(pgm_dir_path: &str, dry_run: bool) -> Result<()> {
@@ -312,7 +318,18 @@ fn apply(pgm_dir_path: &str, dry_run: bool) -> Result<()> {
         return Ok(());
     }
 
-    // Create a temporary file to store the SQL
+    // Check if psql exists
+    if !ProcessCommand::new("psql")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        return Err(anyhow::anyhow!(
+            "psql not found. Please ensure it is installed and in your PATH."
+        ));
+    }
+
+    // Create a temporary file
     let mut temp_file = NamedTempFile::new().context("Failed to create temporary file")?;
     temp_file
         .write_all(sql.as_bytes())
@@ -320,20 +337,35 @@ fn apply(pgm_dir_path: &str, dry_run: bool) -> Result<()> {
 
     // Construct the psql command
     let mut command = ProcessCommand::new("psql");
-    command
-        .arg("-f")
-        .arg(temp_file.path())
-        .arg("-v")
-        .arg("ON_ERROR_STOP=1");
+    command.args(&[
+        "-f",
+        temp_file.path().to_str().unwrap(),
+        "-v",
+        "ON_ERROR_STOP=1",
+    ]);
 
     // Execute the psql command
-    let output = command.output().context("Failed to execute psql command")?;
+    match command.output() {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
 
-    if output.status.success() {
-        Ok(())
-    } else {
-        let error_message = String::from_utf8_lossy(&output.stderr);
-        Err(anyhow::anyhow!("Error applying changes: {}", error_message))
+            // Process stderr and stdout to remove prefix 'psql:/path/to/temp/file:1234: '
+            stderr.lines().chain(stdout.lines()).for_each(|line| {
+                println!("{}", line.split_once(": ").map_or(line, |(_, rest)| rest));
+            });
+
+            if output.status.success() {
+                Ok(())
+            } else {
+                let exit_code = output.status.code().unwrap_or(-1);
+                Err(anyhow::anyhow!(
+                    "psql command failed with exit code: {}",
+                    exit_code
+                ))
+            }
+        }
+        Err(e) => Err(anyhow::anyhow!("Failed to execute psql command: {}.", e)),
     }
 }
 
@@ -366,7 +398,7 @@ fn create_function(pgm_dir_path: &str, name: &str) -> Result<()> {
 
     let template = std::fs::read_to_string("./src/templates/function.sql")
         .context("Failed to read function template")?;
-    let content = template.replace("{{name}}", name);
+    let content = template.replace("<name_placeholder>", name);
     std::fs::write(file_path, content).context("Failed to create function file")?;
 
     println!("Function '{}' created successfully", name);
@@ -430,7 +462,7 @@ fn create_trigger(pgm_dir_path: &str, name: &str) -> Result<()> {
 
     let template = std::fs::read_to_string("./src/templates/trigger_function.sql")
         .context("Failed to read trigger template")?;
-    let content = template.replace("{{name}}", name);
+    let content = template.replace("<name_placeholder>", name);
     std::fs::write(file_path, content).context("Failed to create trigger file")?;
 
     println!("Trigger '{}' created successfully", name);
@@ -474,7 +506,7 @@ fn create_view(pgm_dir_path: &str, name: &str, materialized: bool) -> Result<()>
 
     let template =
         std::fs::read_to_string(template_name).context("Failed to read view template")?;
-    let content = template.replace("{{name}}", name);
+    let content = template.replace("<name_placeholder>", name);
     std::fs::write(file_path, content).context("Failed to create view file")?;
 
     println!(
