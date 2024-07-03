@@ -14,23 +14,82 @@ pgm is a command-line tool used to manage PostgreSQL migrations, functions, trig
 
 [Add installation instructions here]
 
+## Requirements
+
+- `psql`: Required for applying changes to the database.
+- `pg_dump`: Required only if initializing pgm from an existing database schema.
+
+These tools are part of the PostgreSQL distribution. If you don't have them installed:
+
+- macOS: Use Homebrew
+  ```
+  brew install libpq
+  sudo ln -s $(brew --prefix)/opt/libpq/bin/psql /usr/local/bin/psql
+  sudo ln -s $(brew --prefix)/opt/libpq/bin/pg_dump /usr/local/bin/pg_dump
+  ```
+
+- Linux:
+  - Debian/Ubuntu:
+    ```
+    sudo apt-get update
+    sudo apt-get install postgresql-client
+    ```
+
+- Windows: Use [Scoop](https://scoop.sh/)
+  ```
+  scoop install postgresql
+  ```
+
+If CLI options are not available, you can download the full PostgreSQL distribution from the [official PostgreSQL website](https://www.postgresql.org/download/).
+
+Make sure these tools are in your system's PATH after installation.
+
 ## Usage
 
 ### Initialize a new project
 
 ```
-pgm init [path]
+pgm init [--path <path>] [--existing-db]
 ```
 
 Initializes a new project structure in the specified path (default: "postgres").
 
+Options:
+- `--path <path>`: Specify a custom path for the project (default: "postgres")
+- `--existing-db`: Initialize from an existing database using pg_dump
+
+The `init` command works in two ways:
+
+1. Creating a new project structure: This creates the necessary directories for managing your database objects.
+
+2. Initializing from an existing database: When used with the `--existing-db` flag, pgm uses `pg_dump` to get a schema-only dump of your existing database. It then parses this dump to extract functions, triggers, and other database objects, creating a structured project from your current schema. This allows you to start managing your existing database with pgm.
+
+Note: When initializing from an existing database, ensure you have the necessary database connection details set up (e.g., through environment variables or a .pgpass file).
+
+Example:
+```
+PGDATABASE=mydb pgm init --existing-db
+```
+
 ### Apply changes
 
 ```
-pgm apply [path] [--dry-run]
+pgm apply [--path <path>] [--dry-run]
 ```
 
-Compiles and applies changes to the database. Use the `--dry-run` flag to test changes without applying them.
+Compiles and applies changes to the database. Use `--path` for a custom path and `--dry-run` to test without applying.
+
+pgm uses standard PostgreSQL environment variables for connection. Set these before running or use a `.pgpass` file for credentials.
+
+Example:
+```
+PGDATABASE=mydb pgm apply
+```
+
+For a dry run:
+```
+PGDATABASE=mydb pgm apply --dry-run
+```
 
 ### Create new elements
 
@@ -40,7 +99,7 @@ Compiles and applies changes to the database. Use the `--dry-run` flag to test c
 pgm create migration [--path <path>]
 ```
 
-Creates a new migration file with an auto-incremented number. Default path: "postgres/migrations".
+Creates a new migration file with an auto-incremented number. Default path: "postgres".
 
 #### Create a trigger
 
@@ -48,7 +107,7 @@ Creates a new migration file with an auto-incremented number. Default path: "pos
 pgm create trigger <name> [--path <path>]
 ```
 
-Creates a new trigger file with the specified name. Default path: "postgres/triggers".
+Creates a new trigger file with the specified name. Default path: "postgres".
 
 #### Create a view
 
@@ -56,7 +115,25 @@ Creates a new trigger file with the specified name. Default path: "postgres/trig
 pgm create view <name> [--path <path>]
 ```
 
-Creates a new view file with the specified name. Default path: "postgres/views".
+Creates a new view file with the specified name. Default path: "postgres".
+
+#### Create a materialized view
+
+```
+pgm create materialized-view <name> [--path <path>]
+```
+
+Creates a new materialized view file with the specified name. Default path: "postgres".
+
+#### Create a function
+
+```
+pgm create function <name> [--path <path>]
+```
+
+Creates a new function file with the specified name. Default path: "postgres".
+
+Note: For all create commands, the `--path` option refers to the pgm folder path, not the specific subfolder (e.g., triggers, views, etc.). The tool will automatically place the created file in the appropriate subfolder within the specified path.
 
 ## Project Structure
 
