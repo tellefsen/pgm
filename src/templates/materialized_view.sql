@@ -1,0 +1,5 @@
+CREATE MATERIALIZED VIEW {{ name }} AS
+SELECT *
+    FROM some_table 
+WITH (NO DATA);
+REFRESH MATERIALIZED VIEW {{ name }};

@@ -6,7 +6,9 @@ use std::path::Path;
 use std::process::Command as ProcessCommand;
 use tempfile::NamedTempFile;
 
-fn parse_schema_dump(schema_dump: &String, output_dir: &str) -> std::io::Result<()> {
+const DEFAULT_PGM_PATH: &str = "postgres";
+
+fn parse_schema_dump(pgm_dir_path: &str, schema_dump: &String) -> std::io::Result<()> {
     let tokens: Vec<&str> = schema_dump
         .split_inclusive(|c: char| c.is_whitespace())
         .collect();
@@ -73,7 +75,7 @@ fn parse_schema_dump(schema_dump: &String, output_dir: &str) -> std::io::Result<
             function_content.push_str(token);
             if token.contains(&block_label) {
                 let folder = if is_trigger { "triggers" } else { "functions" };
-                let output_path = Path::new(output_dir)
+                let output_path = Path::new(pgm_dir_path)
                     .join(folder)
                     .join(format!("{}.sql", function_name));
                 std::fs::write(output_path, function_content).unwrap();
@@ -88,24 +90,26 @@ fn parse_schema_dump(schema_dump: &String, output_dir: &str) -> std::io::Result<
 
     // Remove all lines starting with -- and other unnecessary lines
     let migrations_file_content = migrations_file_content
-    .lines()
-    .filter(|line| !line.starts_with("--"))
-    .filter(|line| !line.starts_with("SELECT pg_catalog.set_config('search_path'"))
-    .filter(|line| !line.is_empty())
-    .collect::<Vec<&str>>()
-    .join("\n");
+        .lines()
+        .filter(|line| !line.starts_with("--"))
+        .filter(|line| !line.starts_with("SELECT pg_catalog.set_config('search_path'"))
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<&str>>()
+        .join("\n");
 
     // Write the new file content without functions to a new file
-    let migrations_file_path = Path::new("./postgres").join("migrations").join("00000.sql");
+    let migrations_file_path = Path::new(pgm_dir_path).join("migrations").join("00000.sql");
     std::fs::write(migrations_file_path, migrations_file_content)?;
 
     Ok(())
 }
 
-fn initialize() -> Result<()> {
-    // If "./postgres" already exists, exit
-    if Path::new("./postgres").exists() {
-        return Err(anyhow::anyhow!("Directory 'postgres' already exists"));
+fn initialize(pgm_dir_path: &str) -> Result<()> {
+    if Path::new(pgm_dir_path).exists() {
+        return Err(anyhow::anyhow!(
+            "Directory '{}' already exists",
+            pgm_dir_path
+        ));
     }
 
     // Create temporary file for schema dump
@@ -136,28 +140,30 @@ fn initialize() -> Result<()> {
     let schema_dump = std::fs::read_to_string(output_path)?;
 
     // Create new directory "./postgres" and subdirectories
-    std::fs::create_dir_all("./postgres").context("Failed to create directory")?;
-    std::fs::create_dir_all("./postgres/migrations")
+    std::fs::create_dir_all(pgm_dir_path).context("Failed to create directory")?;
+    std::fs::create_dir_all(format!("{}/migrations", pgm_dir_path))
         .context("Failed to create migrations directory")?;
-    std::fs::create_dir_all("./postgres/triggers")
+    std::fs::create_dir_all(format!("{}/triggers", pgm_dir_path))
         .context("Failed to create triggers directory")?;
-    std::fs::create_dir_all("./postgres/views").context("Failed to create views directory")?;
-    std::fs::create_dir_all("./postgres/functions")
+    std::fs::create_dir_all(format!("{}/views", pgm_dir_path))
+        .context("Failed to create views directory")?;
+    std::fs::create_dir_all(format!("{}/functions", pgm_dir_path))
         .context("Failed to create functions directory")?;
 
     // Extract all functions and triggers from schema dump and write them to the appropriate folders
     // Then create a migration file with the changes
-    parse_schema_dump(&schema_dump, "./postgres")
+    parse_schema_dump(pgm_dir_path, &schema_dump)
         .context("Failed to extract functions and triggers")?;
 
     Ok(())
 }
 
-fn build(output: &str) -> Result<()> {
+fn build(pgm_dir_path: &str) -> Result<String> {
     // Check if the postgres directory exists
-    if !Path::new("./postgres").is_dir() {
+    if !Path::new(pgm_dir_path).is_dir() {
         return Err(anyhow::anyhow!(
-            "Directory './postgres' not found. Have you run 'pgm init'?"
+            "Directory '{}' not found. Have you run 'pgm init'?",
+            pgm_dir_path
         ));
     }
 
@@ -190,31 +196,42 @@ CREATE TABLE IF NOT EXISTS pgm_trigger (
 "#,
     );
 
-
     // Process functions
     process_directory(
-        "./postgres/functions",
+        &format!("{}/functions", pgm_dir_path),
         "pgm_function",
         &mut compiled_content,
     )?;
 
     // Process triggers
-    process_directory("./postgres/triggers", "pgm_trigger", &mut compiled_content)?;
+    process_directory(
+        &format!("{}/triggers", pgm_dir_path),
+        "pgm_trigger",
+        &mut compiled_content,
+    )?;
+
+    // Process views
+    process_directory(
+        &format!("{}/views", pgm_dir_path),
+        "pgm_view",
+        &mut compiled_content,
+    )?;
 
     // Process migrations
-    process_migrations(&mut compiled_content)?;
+    process_migrations(pgm_dir_path, &mut compiled_content)?;
 
     // End the main DO block
     compiled_content.push_str("END $pgm$;\n");
 
-    // Write the compiled content to the output file
-    std::fs::write(output, compiled_content).context("Failed to write compiled file")?;
-
-    Ok(())
+    Ok(compiled_content)
 }
 
-fn process_directory(dir: &str, table: &str, compiled_content: &mut String) -> Result<()> {
-    for entry in std::fs::read_dir(dir)? {
+fn process_directory(
+    full_dir_path: &str,
+    table: &str,
+    compiled_content: &mut String,
+) -> Result<()> {
+    for entry in std::fs::read_dir(full_dir_path)? {
         let entry = entry?;
         let path = entry.path();
         if path.is_file() && path.extension().map_or(false, |ext| ext == "sql") {
@@ -223,8 +240,10 @@ fn process_directory(dir: &str, table: &str, compiled_content: &mut String) -> R
             let hash = format!("{:x}", md5::compute(&content));
             let file_name = path.file_stem().unwrap().to_str().unwrap();
 
+            let file_path = format!("{}/{}", full_dir_path, file_name);
+
             compiled_content.push_str(&format!(
-                "-- RUN {dir}/{file_name}.sql --
+                "-- RUN {file_path} --
 IF (SELECT hash FROM {table} WHERE name = '{file_name}') IS DISTINCT FROM '{hash}' THEN
 {content}
 
@@ -233,11 +252,11 @@ IF (SELECT hash FROM {table} WHERE name = '{file_name}') IS DISTINCT FROM '{hash
     ON CONFLICT (name) 
     DO UPDATE SET hash = EXCLUDED.hash, applied_at = CURRENT_TIMESTAMP;
     
-    RAISE NOTICE 'Applied {dir}/{file_name}.sql';
+    RAISE NOTICE 'Applied {file_path}';
 ELSE
-    RAISE NOTICE 'Skipped {dir}/{file_name}.sql (no changes)';
+    RAISE NOTICE 'Skipped {file_path} (no changes)';
 END IF;
--- DONE {dir}/{file_name}.sql --
+-- DONE {file_path} --
 
 "
             ));
@@ -246,8 +265,9 @@ END IF;
     Ok(())
 }
 
-fn process_migrations(compiled_content: &mut String) -> Result<()> {
-    let migrations_dir = "./postgres/migrations";
+fn process_migrations(pgm_dir_path: &str, compiled_content: &mut String) -> Result<()> {
+    let migrations_dir = format!("{}/migrations", pgm_dir_path);
+    let migrations_dir = migrations_dir.as_str();
     let mut migration_files: Vec<_> = std::fs::read_dir(migrations_dir)?
         .filter_map(|entry| entry.ok())
         .filter(|entry| {
@@ -263,17 +283,19 @@ fn process_migrations(compiled_content: &mut String) -> Result<()> {
 
         let file_name = path.file_stem().unwrap().to_str().unwrap();
 
+        let file_path = format!("{}/{}.sql", &migrations_dir, file_name);
+
         compiled_content.push_str(&format!(
-            "-- RUN {migrations_dir}/{file_name}.sql --
-IF NOT EXISTS (SELECT 1 FROM pgm_migration WHERE name = '{file_name}') THEN
+            "-- RUN {file_path} --
+IF NOT EXISTS (SELECT 1 FROM pgm_migration WHERE name = '{file_path}') THEN
 {content}
 
-INSERT INTO pgm_migration (name) VALUES ('{file_name}');
-RAISE NOTICE 'Applied migration: {file_name}';
+INSERT INTO pgm_migration (name) VALUES ('{file_path}');
+RAISE NOTICE 'Applied migration: {file_path}';
 ELSE
-RAISE NOTICE 'Skipped migration: {file_name} (already applied)';
+RAISE NOTICE 'Skipped migration: {file_path} (already applied)';
 END IF;
--- DONE {migrations_dir}/{file_name}.sql --
+-- DONE {file_path} --
 
 "
         ));
@@ -281,20 +303,28 @@ END IF;
     Ok(())
 }
 
-fn apply(input_file: &str) -> Result<()> {
-    // Read the compiled SQL
-    let sql = std::fs::read_to_string(input_file).context("Failed to read compiled SQL file")?;
+fn apply(pgm_dir_path: &str, dry_run: bool) -> Result<()> {
+    // Compile the SQL
+    let sql = build(pgm_dir_path).expect("Failed to compile SQL");
+
+    if dry_run {
+        println!("{}", sql);
+        return Ok(());
+    }
 
     // Create a temporary file to store the SQL
     let mut temp_file = NamedTempFile::new().context("Failed to create temporary file")?;
-    temp_file.write_all(sql.as_bytes()).context("Failed to write SQL to temporary file")?;
+    temp_file
+        .write_all(sql.as_bytes())
+        .context("Failed to write SQL to temporary file")?;
 
     // Construct the psql command
     let mut command = ProcessCommand::new("psql");
-    command.arg("-f")
-           .arg(temp_file.path())
-           .arg("-v")
-           .arg("ON_ERROR_STOP=1");
+    command
+        .arg("-f")
+        .arg(temp_file.path())
+        .arg("-v")
+        .arg("ON_ERROR_STOP=1");
 
     // Execute the psql command
     let output = command.output().context("Failed to execute psql command")?;
@@ -307,16 +337,18 @@ fn apply(input_file: &str) -> Result<()> {
     }
 }
 
-fn create_function(name: &str) -> Result<()> {
-    if !Path::new("./postgres").exists() {
-        return Err(anyhow::anyhow!("Directory './postgres' not found. Have you run 'pgm init'?"));
+fn create_function(pgm_dir_path: &str, name: &str) -> Result<()> {
+    if !Path::new(pgm_dir_path).exists() {
+        return Err(anyhow::anyhow!(
+            "Directory '{}' not found. Have you run 'pgm init'?",
+            pgm_dir_path
+        ));
     }
 
-    let path = Path::new("./postgres/functions").join(format!("{}.sql", name));
-    std::fs::create_dir_all("./postgres/functions")
-        .context("Failed to create functions directory")?;
+    let file_path = Path::new(pgm_dir_path).join(format!("{}.sql", name));
+    std::fs::create_dir_all(&file_path).context("Failed to create functions directory")?;
 
-    if path.exists() {
+    if file_path.exists() {
         print!(
             "Function '{}' already exists. Do you want to reset it? (y/N): ",
             name
@@ -335,29 +367,33 @@ fn create_function(name: &str) -> Result<()> {
     let template = std::fs::read_to_string("./src/templates/function.sql")
         .context("Failed to read function template")?;
     let content = template.replace("{{name}}", name);
-    std::fs::write(path, content).context("Failed to create function file")?;
+    std::fs::write(file_path, content).context("Failed to create function file")?;
 
     println!("Function '{}' created successfully", name);
     Ok(())
 }
 
-fn create_migration() -> Result<()> {
-    if !Path::new("./postgres").exists() {
-        return Err(anyhow::anyhow!("Directory './postgres' not found. Have you run 'pgm init'?"));
+fn create_migration(pgm_dir_path: &str) -> Result<()> {
+    if !Path::new(pgm_dir_path).exists() {
+        return Err(anyhow::anyhow!(
+            "Directory '{}' not found. Have you run 'pgm init'?",
+            pgm_dir_path
+        ));
     }
 
-    let migrations_dir = "./postgres/migrations";
+    let migrations_dir = format!("{}/migrations", pgm_dir_path);
+    let migrations_dir = migrations_dir.as_str();
     let last_migration_file = std::fs::read_dir(migrations_dir)?
         .filter_map(|entry| entry.ok())
         .max_by_key(|entry| entry.file_name());
-    let last_migration_number = last_migration_file
-        .map_or(0, |entry| {
-            entry.file_name()
-                .to_str()
-                .and_then(|s| s.split('.').next())
-                .and_then(|s| s.parse::<i32>().ok())
-                .unwrap_or(0)
-        });
+    let last_migration_number = last_migration_file.map_or(0, |entry| {
+        entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.split('.').next())
+            .and_then(|s| s.parse::<i32>().ok())
+            .unwrap_or(0)
+    });
     let next_migration_number = format!("{:05}", last_migration_number + 1);
     let next_migration_file = format!("{}/{}.sql", migrations_dir, next_migration_number);
     std::fs::create_dir_all(migrations_dir).context("Failed to create migrations directory")?;
@@ -365,16 +401,18 @@ fn create_migration() -> Result<()> {
     Ok(())
 }
 
-fn create_trigger(name: &str) -> Result<()> {
-    if !Path::new("./postgres").exists() {
-        return Err(anyhow::anyhow!("Directory './postgres' not found. Have you run 'pgm init'?"));
+fn create_trigger(pgm_dir_path: &str, name: &str) -> Result<()> {
+    if !Path::new(pgm_dir_path).exists() {
+        return Err(anyhow::anyhow!(
+            "Directory '{}' not found. Have you run 'pgm init'?",
+            pgm_dir_path
+        ));
     }
 
-    let path = Path::new("./postgres/triggers").join(format!("{}.sql", name));
-    std::fs::create_dir_all("./postgres/triggers")
-        .context("Failed to create triggers directory")?;
+    let file_path = Path::new(pgm_dir_path).join(format!("{}.sql", name));
+    std::fs::create_dir_all(&file_path).context("Failed to create triggers directory")?;
 
-    if path.exists() {
+    if file_path.exists() {
         print!(
             "Trigger '{}' already exists. Do you want to reset it? (y/N): ",
             name
@@ -393,9 +431,61 @@ fn create_trigger(name: &str) -> Result<()> {
     let template = std::fs::read_to_string("./src/templates/trigger_function.sql")
         .context("Failed to read trigger template")?;
     let content = template.replace("{{name}}", name);
-    std::fs::write(path, content).context("Failed to create trigger file")?;
+    std::fs::write(file_path, content).context("Failed to create trigger file")?;
 
     println!("Trigger '{}' created successfully", name);
+    Ok(())
+}
+
+fn create_view(pgm_dir_path: &str, name: &str, materialized: bool) -> Result<()> {
+    if !Path::new(pgm_dir_path).exists() {
+        return Err(anyhow::anyhow!(
+            "Directory '{}' not found. Have you run 'pgm init'?",
+            pgm_dir_path
+        ));
+    }
+
+    let views_dir = Path::new(pgm_dir_path).join("views");
+    std::fs::create_dir_all(&views_dir).context("Failed to create views directory")?;
+
+    let file_path = views_dir.join(format!("{}.sql", name));
+
+    if file_path.exists() {
+        print!(
+            "View '{}' already exists. Do you want to reset it? (y/N): ",
+            name
+        );
+        io::stdout().flush().unwrap();
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).unwrap();
+
+        if !input.trim().eq_ignore_ascii_case("y") {
+            println!("View creation aborted.");
+            return Ok(());
+        }
+    }
+
+    let template_name = if materialized {
+        "./src/templates/materialized_view.sql"
+    } else {
+        "./src/templates/view.sql"
+    };
+
+    let template =
+        std::fs::read_to_string(template_name).context("Failed to read view template")?;
+    let content = template.replace("{{name}}", name);
+    std::fs::write(file_path, content).context("Failed to create view file")?;
+
+    println!(
+        "{} '{}' created successfully",
+        if materialized {
+            "Materialized view"
+        } else {
+            "View"
+        },
+        name
+    );
     Ok(())
 }
 
@@ -406,25 +496,56 @@ fn main() {
         .about(
             "A CLI tool for managing postgres database migrations, triggers, views and functions",
         )
-        .subcommand(Command::new("init").about("Initializes the directory"))
+        .subcommand(
+            Command::new("init").about("Initializes the directory").arg(
+                Arg::new("path")
+                    .help("The path to the directory containing the database files")
+                    .default_value(DEFAULT_PGM_PATH)
+                    .value_parser(clap::value_parser!(String)),
+            ),
+        )
         .subcommand(
             Command::new("apply")
-                .about("Applies the changes")
+                .about("Compiles the changes and applies them to the database")
                 .arg(
-                    Arg::new("input-file")
-                        .help("The input file path to apply")
-                        .default_value("postgres/output.sql")
+                    Arg::new("path")
+                        .long("path")
+                        .help("The path to the directory containing the database files")
+                        .default_value(DEFAULT_PGM_PATH)
                         .value_parser(clap::value_parser!(String)),
+                )
+                .arg(
+                    Arg::new("dry-run")
+                        .long("dry-run")
+                        .help("Prints the SQL that would be applied but does not apply it")
+                        .action(clap::ArgAction::SetTrue),
                 ),
         )
         .subcommand(
             Command::new("create")
                 .about("Creates a new database object")
                 .subcommand_required(true)
-                .subcommand(Command::new("migration").about("Creates a new migration"))
+                .subcommand(
+                    Command::new("migration")
+                        .about("Creates a new migration")
+                        .arg(
+                            Arg::new("path")
+                                .long("path")
+                                .help("The path to the directory containing the database files")
+                                .default_value(DEFAULT_PGM_PATH)
+                                .value_parser(clap::value_parser!(String)),
+                        ),
+                )
                 .subcommand(
                     Command::new("trigger")
                         .about("Creates a new trigger")
+                        .arg(
+                            Arg::new("path")
+                                .long("path")
+                                .help("The path to the directory containing the database files")
+                                .default_value(DEFAULT_PGM_PATH)
+                                .value_parser(clap::value_parser!(String)),
+                        )
                         .arg(
                             Arg::new("name")
                                 .help("The name of the trigger")
@@ -436,20 +557,45 @@ fn main() {
                     Command::new("view")
                         .about("Creates a new view")
                         .arg(
+                            Arg::new("path")
+                                .long("path")
+                                .help("The path to the directory containing the database files")
+                                .default_value(DEFAULT_PGM_PATH)
+                                .value_parser(clap::value_parser!(String)),
+                        )
+                        .arg(
                             Arg::new("name")
                                 .help("The name of the view")
                                 .required(true)
                                 .value_parser(clap::value_parser!(String)),
+                        ),
+                )
+                .subcommand(
+                    Command::new("materialized-view")
+                        .about("Creates a new materialized view")
+                        .arg(
+                            Arg::new("path")
+                                .long("path")
+                                .help("The path to the directory containing the database files")
+                                .default_value(DEFAULT_PGM_PATH)
+                                .value_parser(clap::value_parser!(String)),
                         )
                         .arg(
-                            Arg::new("materialized")
-                                .long("materialized")
-                                .help("Creates a materialized view"),
+                            Arg::new("name")
+                                .help("The name of the materialized view")
+                                .required(true)
+                                .value_parser(clap::value_parser!(String)),
                         ),
                 )
                 .subcommand(
                     Command::new("function")
                         .about("Creates a new function")
+                        .arg(
+                            Arg::new("path")
+                                .help("The path to the directory containing the database files")
+                                .default_value(DEFAULT_PGM_PATH)
+                                .value_parser(clap::value_parser!(String)),
+                        )
                         .arg(
                             Arg::new("name")
                                 .help("The name of the function")
@@ -458,83 +604,96 @@ fn main() {
                         ),
                 ),
         )
-        .subcommand(
-            Command::new("build")
-                .about("Compiles changes to a single .sql file that can be deployed")
-                .arg(
-                    Arg::new("output")
-                        .help("The output file path")
-                        .default_value("postgres/output.sql")
-                        .value_parser(clap::value_parser!(String)),
-                ),
-        )
         .get_matches();
 
     match matches.subcommand() {
-        Some(("init", _)) => {
-            if let Err(e) = initialize() {
+        Some(("init", init_matches)) => {
+            let path = init_matches
+                .get_one::<String>("path")
+                .expect("Input argument is required");
+            if let Err(e) = initialize(path) {
                 eprintln!("Error during initialization: {}", e);
             } else {
                 println!("Initialized successfully");
             }
         }
         Some(("apply", apply_matches)) => {
-            let input_file = apply_matches
-                .get_one::<String>("input-file")
+            let path = apply_matches
+                .get_one::<String>("path")
                 .expect("Input argument is required");
-            match apply(input_file) {
-                Ok(_) => println!("Changes applied successfully"),
+            let dry_run = *apply_matches
+                .get_one::<bool>("dry-run")
+                .expect("Default value should always be present");
+
+            match apply(path, dry_run) {
+                Ok(_) => {
+                    if !dry_run {
+                        println!("Changes applied successfully");
+                    }
+                }
                 Err(e) => eprintln!("Error applying changes: {}", e),
             }
         }
         Some(("create", create_matches)) => match create_matches.subcommand() {
             Some(("migration", _)) => {
-                if let Err(e) = create_migration() {
+                let path = create_matches
+                    .get_one::<String>("path")
+                    .expect("Input argument is required");
+                if let Err(e) = create_migration(path) {
                     eprintln!("Error during migration creation: {}", e);
                 } else {
                     println!("Migration created successfully");
                 }
             }
             Some(("trigger", trigger_matches)) => {
+                let path = trigger_matches
+                    .get_one::<String>("path")
+                    .expect("Input argument is required");
                 let name = trigger_matches
                     .get_one::<String>("name")
                     .expect("Name argument is required");
-                if let Err(e) = create_trigger(name) {
+                if let Err(e) = create_trigger(path, name) {
                     eprintln!("Error during trigger creation: {}", e);
                 }
             }
             Some(("view", view_matches)) => {
+                let path = view_matches
+                    .get_one::<String>("path")
+                    .expect("Input argument is required");
                 let name = view_matches
                     .get_one::<String>("name")
                     .expect("Name argument is required");
-                if view_matches.contains_id("materialized") {
-                    println!("Creating a new materialized view: {}", name);
-                } else {
-                    println!("Creating a new view: {}", name);
+
+                if let Err(e) = create_view(path, name, false) {
+                    eprintln!("Error during view creation: {}", e);
                 }
-                todo!("create view command logic");
+            }
+            Some(("materialized-view", view_matches)) => {
+                let path = view_matches
+                    .get_one::<String>("path")
+                    .expect("Input argument is required");
+                let name = view_matches
+                    .get_one::<String>("name")
+                    .expect("Name argument is required");
+
+                if let Err(e) = create_view(path, name, true) {
+                    eprintln!("Error during materialized view creation: {}", e);
+                }
             }
             Some(("function", function_matches)) => {
+                let path = function_matches
+                    .get_one::<String>("path")
+                    .expect("Input argument is required");
                 let name = function_matches
                     .get_one::<String>("name")
                     .expect("Name argument is required");
 
-                if let Err(e) = create_function(name) {
+                if let Err(e) = create_function(path, name) {
                     eprintln!("Error during function creation: {}", e);
                 }
             }
             _ => {}
         },
-        Some(("build", build_matches)) => {
-            let output = build_matches
-                .get_one::<String>("output")
-                .expect("Output argument is required");
-            if let Err(e) = build(output) {
-                eprintln!("Error during build: {}", e);
-            } else {
-                println!("Build completed successfully. Output file: {}", output);
-            }
-        }
         _ => {}
     }
 }
