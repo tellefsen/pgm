@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Arg, Command};
 use md5;
+
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::Command as ProcessCommand;
@@ -604,7 +605,9 @@ fn create_view(pgm_dir_path: &str, name: &str, materialized: bool) -> Result<()>
 
     let template =
         std::fs::read_to_string(template_name).context("Failed to read view template")?;
-    let content = template.replace("<name_placeholder>", name);
+    let rand_hash1 = format!("{:x}", md5::compute(std::time::Instant::now().elapsed().as_secs().to_string()));
+    let rand_hash2 = format!("{:x}", md5::compute(std::time::Instant::now().elapsed().as_secs().to_string()));
+    let content = template.replace("<name_placeholder>", name).replace("<random_hash1>", &rand_hash1).replace("<random_hash2>", &rand_hash2);
     std::fs::write(file_path, content).context("Failed to create view file")?;
 
     println!(
