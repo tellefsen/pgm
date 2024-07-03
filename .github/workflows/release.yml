@@ -18,27 +18,15 @@ jobs:
     name: Create Release
     runs-on: ubuntu-latest
     outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
       version: ${{ steps.get_version.outputs.version }}
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
 
       - name: Get version from Cargo.toml
         id: get_version
         run: |
           version=$(grep '^version =' Cargo.toml | cut -d '"' -f 2)
           echo "version=$version" >> $GITHUB_OUTPUT
-
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: v${{ steps.get_version.outputs.version }}
-          release_name: Release v${{ steps.get_version.outputs.version }}
-          draft: ${{ github.event.inputs.release_type == 'draft' }}
-          prerelease: ${{ github.event.inputs.release_type == 'pre-release' }}
 
   build_and_release:
     name: Build and Release
@@ -49,16 +37,13 @@ jobs:
         include:
           - os: ubuntu-latest
             artifact_name: pgm-linux
-            asset_name: pgm-linux
           - os: macos-latest
             artifact_name: pgm-macos
-            asset_name: pgm-macos
           - os: windows-latest
             artifact_name: pgm-windows.exe
-            asset_name: pgm-windows.exe
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
     
     - name: Set up Rust
       uses: actions-rs/toolchain@v1
@@ -81,12 +66,15 @@ jobs:
           mv target/release/pgm ${{ matrix.artifact_name }}
         fi
 
-    - name: Upload Release Asset
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Release
+      uses: ncipollo/release-action@v1
       with:
-        upload_url: ${{ needs.create_release.outputs.upload_url }}
-        asset_path: ./${{ matrix.artifact_name }}
-        asset_name: ${{ matrix.asset_name }}
-        asset_content_type: application/octet-stream
+        artifacts: ${{ matrix.artifact_name }}
+        token: ${{ secrets.GITHUB_TOKEN }}
+        tag: v${{ needs.create_release.outputs.version }}
+        name: Release v${{ needs.create_release.outputs.version }}
+        draft: ${{ github.event.inputs.release_type == 'draft' }}
+        prerelease: ${{ github.event.inputs.release_type == 'pre-release' }}
+        allowUpdates: true
+        updateOnlyUnreleased: ${{ github.event.inputs.release_type != 'full' }}
+        generateReleaseNotes: true
