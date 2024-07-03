@@ -624,7 +624,7 @@ fn create_view(pgm_dir_path: &str, name: &str, materialized: bool) -> Result<()>
 
 fn main() {
     let matches = Command::new("pgm")
-        .version("0.1")
+        .version(env!("CARGO_PKG_VERSION"))
         .arg_required_else_help(true)
         .about(
             "A CLI tool for managing postgres database migrations, triggers, views and functions",
