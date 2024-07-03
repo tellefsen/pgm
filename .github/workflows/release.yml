@@ -13,6 +13,9 @@ on:
           - draft
           - full
 
+permissions:
+  contents: write
+
 jobs:
   create_release:
     name: Create Release
