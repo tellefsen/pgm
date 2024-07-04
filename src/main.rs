@@ -16,7 +16,6 @@ fn parse_schema_dump(pgm_dir_path: &str, schema_dump: &String) -> std::io::Resul
     let mut token_iter = tokens.iter();
 
     let mut migrations_file_content = String::new();
-
     let mut object_name = String::new();
     let mut object_content = String::new();
     let mut in_object = false;
@@ -67,7 +66,8 @@ fn parse_schema_dump(pgm_dir_path: &str, schema_dump: &String) -> std::io::Resul
                                 while let Some(next_token) = token_iter.next() {
                                     object_content.push_str(next_token);
                                     if next_token.trim().eq_ignore_ascii_case("RETURNS") {
-                                        let return_statement = token_iter.next().unwrap().to_string();
+                                        let return_statement =
+                                            token_iter.next().unwrap().to_string();
                                         object_content.push_str(&return_statement);
                                         if return_statement.trim().eq_ignore_ascii_case("TRIGGER") {
                                             object_type = "trigger".to_string();
@@ -78,7 +78,9 @@ fn parse_schema_dump(pgm_dir_path: &str, schema_dump: &String) -> std::io::Resul
                                 // Look for opening block label
                                 while let Some(next_token) = token_iter.next() {
                                     object_content.push_str(next_token);
-                                    if next_token.trim().starts_with('$') && next_token.trim().ends_with('$') {
+                                    if next_token.trim().starts_with('$')
+                                        && next_token.trim().ends_with('$')
+                                    {
                                         block_label = next_token.trim().to_string();
                                         break;
                                     }
@@ -91,14 +93,42 @@ fn parse_schema_dump(pgm_dir_path: &str, schema_dump: &String) -> std::io::Resul
                 migrations_file_content.push_str(token);
             }
         } else {
-            // Look for closing block label or semicolon for views
             object_content.push_str(token);
-            if (object_type == "function" || object_type == "trigger") && token.contains(&block_label) {
-                write_object_to_file(pgm_dir_path, &object_type, &object_name, &object_content)?;
-                reset_object_state(&mut in_object, &mut object_name, &mut object_content, &mut block_label, &mut object_type);
-            } else if (object_type == "view" || object_type == "materialized_view") && token.trim().ends_with(';') {
-                write_object_to_file(pgm_dir_path, &object_type, &object_name, &object_content)?;
-                reset_object_state(&mut in_object, &mut object_name, &mut object_content, &mut block_label, &mut object_type);
+            if (object_type == "function" || object_type == "trigger")
+                && token.contains(&block_label)
+            {
+                // Write object to file
+                let folder = if object_type == "function" {
+                    "functions"
+                } else {
+                    "triggers"
+                };
+                let output_path = Path::new(pgm_dir_path)
+                    .join(folder)
+                    .join(format!("{}.sql", object_name));
+                std::fs::write(output_path, &object_content)?;
+
+                // Reset object state
+                in_object = false;
+                object_name.clear();
+                object_content.clear();
+                block_label.clear();
+                object_type.clear();
+            } else if (object_type == "view" || object_type == "materialized_view")
+                && token.trim().ends_with(';')
+            {
+                // Write object to file
+                let output_path = Path::new(pgm_dir_path)
+                    .join("views")
+                    .join(format!("{}.sql", object_name));
+                std::fs::write(output_path, &object_content)?;
+
+                // Reset object state
+                in_object = false;
+                object_name.clear();
+                object_content.clear();
+                block_label.clear();
+                object_type.clear();
             }
         }
     }
@@ -118,29 +148,6 @@ fn parse_schema_dump(pgm_dir_path: &str, schema_dump: &String) -> std::io::Resul
     std::fs::write(migrations_file_path, migrations_file_content)?;
 
     Ok(())
-}
-
-fn write_object_to_file(pgm_dir_path: &str, object_type: &str, object_name: &str, object_content: &str) -> std::io::Result<()> {
-    let folder = match object_type {
-        "function" => "functions",
-        "trigger" => "triggers",
-        "view" => "views",
-        "materialized_view" => "views",
-        _ => "",
-    };
-    let output_path = Path::new(pgm_dir_path)
-        .join(folder)
-        .join(format!("{}.sql", object_name));
-    std::fs::write(output_path, object_content)?;
-    Ok(())
-}
-
-fn reset_object_state(in_object: &mut bool, object_name: &mut String, object_content: &mut String, block_label: &mut String, object_type: &mut String) {
-    *in_object = false;
-    *object_name = String::new();
-    *object_content = String::new();
-    *block_label = String::new();
-    *object_type = String::new();
 }
 
 fn initialize(pgm_dir_path: &str, existing_db: bool) -> Result<()> {
@@ -642,9 +649,18 @@ fn create_view(pgm_dir_path: &str, name: &str, materialized: bool) -> Result<()>
 
     let template =
         std::fs::read_to_string(template_name).context("Failed to read view template")?;
-    let rand_hash1 = format!("{:x}", md5::compute(std::time::Instant::now().elapsed().as_secs().to_string()));
-    let rand_hash2 = format!("{:x}", md5::compute(std::time::Instant::now().elapsed().as_secs().to_string()));
-    let content = template.replace("<name_placeholder>", name).replace("<random_hash1>", &rand_hash1).replace("<random_hash2>", &rand_hash2);
+    let rand_hash1 = format!(
+        "{:x}",
+        md5::compute(std::time::Instant::now().elapsed().as_secs().to_string())
+    );
+    let rand_hash2 = format!(
+        "{:x}",
+        md5::compute(std::time::Instant::now().elapsed().as_secs().to_string())
+    );
+    let content = template
+        .replace("<name_placeholder>", name)
+        .replace("<random_hash1>", &rand_hash1)
+        .replace("<random_hash2>", &rand_hash2);
     std::fs::write(file_path, content).context("Failed to create view file")?;
 
     println!(
