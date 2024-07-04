@@ -17,74 +17,88 @@ fn parse_schema_dump(pgm_dir_path: &str, schema_dump: &String) -> std::io::Resul
 
     let mut migrations_file_content = String::new();
 
-    let mut function_name = String::new();
-    let mut function_content = String::new();
-    let mut in_function = false;
+    let mut object_name = String::new();
+    let mut object_content = String::new();
+    let mut in_object = false;
     let mut block_label = String::new();
-    let mut is_trigger = false;
+    let mut object_type = String::new();
 
     while let Some(&token) = token_iter.next() {
-        if !in_function {
+        if !in_object {
             // Look for CREATE
             if token.trim().eq_ignore_ascii_case("CREATE") {
-                // Then look for FUNCTION
+                // Then look for FUNCTION, VIEW, or MATERIALIZED VIEW
                 if let Some(next_token) = token_iter.next() {
-                    if next_token.trim().eq_ignore_ascii_case("FUNCTION") {
-                        in_function = true;
-                        function_content.push_str("CREATE OR REPLACE FUNCTION ");
-                        // Then look for the function name
-                        if let Some(name_token) = token_iter.next() {
-                            let func_name_block = name_token.to_string();
-                            function_name = func_name_block
-                                .split("(")
-                                .next()
-                                .expect("Expected function name")
-                                .to_string();
-                            function_content.push_str(&func_name_block);
-                            // Then look for what the function returns
-                            while let Some(next_token) = token_iter.next() {
-                                function_content.push_str(next_token);
-                                if next_token.trim().eq_ignore_ascii_case("RETURNS") {
-                                    let return_statement = token_iter.next().unwrap().to_string();
-                                    function_content.push_str(&return_statement);
-                                    is_trigger =
-                                        return_statement.trim().eq_ignore_ascii_case("TRIGGER");
-                                    break;
-                                }
-                            }
-                            // Then look for opening block eg. $$ or $function$ or any other label like $mylabel$
-                            while let Some(next_token) = token_iter.next() {
-                                function_content.push_str(next_token);
-                                if next_token.trim().starts_with('$')
-                                    && next_token.trim().ends_with('$')
-                                {
-                                    block_label = next_token.trim().to_string();
-                                    break;
-                                }
+                    let next_token_trimmed = next_token.trim();
+                    if next_token_trimmed.eq_ignore_ascii_case("FUNCTION") {
+                        object_type = "function".to_string();
+                        in_object = true;
+                        object_content.push_str("CREATE OR REPLACE FUNCTION ");
+                    } else if next_token_trimmed.eq_ignore_ascii_case("VIEW") {
+                        object_type = "view".to_string();
+                        in_object = true;
+                        object_content.push_str("CREATE OR REPLACE VIEW ");
+                    } else if next_token_trimmed.eq_ignore_ascii_case("MATERIALIZED") {
+                        if let Some(view_token) = token_iter.next() {
+                            if view_token.trim().eq_ignore_ascii_case("VIEW") {
+                                object_type = "materialized_view".to_string();
+                                in_object = true;
+                                object_content.push_str("CREATE MATERIALIZED VIEW ");
                             }
                         }
                     } else {
                         migrations_file_content.push_str(token);
-                        migrations_file_content.push_str(&next_token)
+                        migrations_file_content.push_str(next_token);
+                    }
+
+                    if in_object {
+                        // Extract object name
+                        if let Some(name_token) = token_iter.next() {
+                            let name_block = name_token.to_string();
+                            object_name = name_block
+                                .split(|c| c == '(' || c == ' ')
+                                .next()
+                                .expect("Expected object name")
+                                .to_string();
+                            object_content.push_str(&name_block);
+
+                            // For functions, look for RETURNS and block label
+                            if object_type == "function" {
+                                while let Some(next_token) = token_iter.next() {
+                                    object_content.push_str(next_token);
+                                    if next_token.trim().eq_ignore_ascii_case("RETURNS") {
+                                        let return_statement = token_iter.next().unwrap().to_string();
+                                        object_content.push_str(&return_statement);
+                                        if return_statement.trim().eq_ignore_ascii_case("TRIGGER") {
+                                            object_type = "trigger".to_string();
+                                        }
+                                        break;
+                                    }
+                                }
+                                // Look for opening block label
+                                while let Some(next_token) = token_iter.next() {
+                                    object_content.push_str(next_token);
+                                    if next_token.trim().starts_with('$') && next_token.trim().ends_with('$') {
+                                        block_label = next_token.trim().to_string();
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             } else {
                 migrations_file_content.push_str(token);
             }
         } else {
-            // Look for closing block label if not keep reading
-            function_content.push_str(token);
-            if token.contains(&block_label) {
-                let folder = if is_trigger { "triggers" } else { "functions" };
-                let output_path = Path::new(pgm_dir_path)
-                    .join(folder)
-                    .join(format!("{}.sql", function_name));
-                std::fs::write(output_path, function_content).unwrap();
-                in_function = false;
-                function_name = String::new();
-                block_label = String::new();
-                function_content = String::new();
-                is_trigger = false;
+            // Look for closing block label or semicolon for views
+            object_content.push_str(token);
+            if (object_type == "function" || object_type == "trigger") && token.contains(&block_label) {
+                write_object_to_file(pgm_dir_path, &object_type, &object_name, &object_content)?;
+                reset_object_state(&mut in_object, &mut object_name, &mut object_content, &mut block_label, &mut object_type);
+            } else if (object_type == "view" || object_type == "materialized_view") && token.trim().ends_with(';') {
+                write_object_to_file(pgm_dir_path, &object_type, &object_name, &object_content)?;
+                reset_object_state(&mut in_object, &mut object_name, &mut object_content, &mut block_label, &mut object_type);
             }
         }
     }
@@ -104,6 +118,29 @@ fn parse_schema_dump(pgm_dir_path: &str, schema_dump: &String) -> std::io::Resul
     std::fs::write(migrations_file_path, migrations_file_content)?;
 
     Ok(())
+}
+
+fn write_object_to_file(pgm_dir_path: &str, object_type: &str, object_name: &str, object_content: &str) -> std::io::Result<()> {
+    let folder = match object_type {
+        "function" => "functions",
+        "trigger" => "triggers",
+        "view" => "views",
+        "materialized_view" => "views",
+        _ => "",
+    };
+    let output_path = Path::new(pgm_dir_path)
+        .join(folder)
+        .join(format!("{}.sql", object_name));
+    std::fs::write(output_path, object_content)?;
+    Ok(())
+}
+
+fn reset_object_state(in_object: &mut bool, object_name: &mut String, object_content: &mut String, block_label: &mut String, object_type: &mut String) {
+    *in_object = false;
+    *object_name = String::new();
+    *object_content = String::new();
+    *block_label = String::new();
+    *object_type = String::new();
 }
 
 fn initialize(pgm_dir_path: &str, existing_db: bool) -> Result<()> {
@@ -145,10 +182,10 @@ fn initialize(pgm_dir_path: &str, existing_db: bool) -> Result<()> {
         // Create directory structure
         create_directory_structure(pgm_dir_path)?;
 
-        // Extract all functions and triggers from schema dump and write them to the appropriate folders
+        // Extract all functions, triggers, views, and materialized views from schema dump and write them to the appropriate folders
         // Then create a migration file with the changes
         parse_schema_dump(pgm_dir_path, &schema_dump)
-            .context("Failed to extract functions and triggers")?;
+            .context("Failed to extract functions, triggers, views, and materialized views")?;
     } else {
         // Create directory structure without using pg_dump
         create_directory_structure(pgm_dir_path)?;
