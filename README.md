@@ -41,7 +41,6 @@ pgm apply [--path <path>] [--dry-run] [--fake]
 pgm create migration [--path <path>]
 pgm create trigger <name> [--path <path>]
 pgm create view <name> [--path <path>]
-pgm create materialized-view <name> [--path <path>]
 pgm create function <name> [--path <path>]
 ```
 

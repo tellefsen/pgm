@@ -1,153 +1,280 @@
 use anyhow::{Context, Result};
 use clap::{Arg, Command};
 use md5;
-
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::Command as ProcessCommand;
 use tempfile::NamedTempFile;
 
 const DEFAULT_PGM_PATH: &str = "postgres";
+const INITIAL_MIGRATION_FILE_NAME: &str = "00000.sql";
 
-fn parse_schema_dump(pgm_dir_path: &str, schema_dump: &String) -> std::io::Result<()> {
-    let tokens: Vec<&str> = schema_dump
-        .split_inclusive(|c: char| c.is_whitespace())
-        .collect();
-    let mut token_iter = tokens.iter();
+fn get_initial_migration_from_db() -> Result<NamedTempFile> {
+    // Create temporary file for schema dump
+    let schema_dump_file =
+        NamedTempFile::new().context("Failed to create temporary file for schema dump")?;
 
-    let mut migrations_file_content = String::new();
-    let mut object_name = String::new();
-    let mut object_content = String::new();
-    let mut in_object = false;
-    let mut block_label = String::new();
-    let mut object_type = String::new();
-
-    while let Some(&token) = token_iter.next() {
-        if !in_object {
-            // Look for CREATE
-            if token.trim().eq_ignore_ascii_case("CREATE") {
-                // Then look for FUNCTION, VIEW, or MATERIALIZED VIEW
-                if let Some(next_token) = token_iter.next() {
-                    let next_token_trimmed = next_token.trim();
-                    if next_token_trimmed.eq_ignore_ascii_case("FUNCTION") {
-                        object_type = "function".to_string();
-                        in_object = true;
-                        object_content.push_str("CREATE OR REPLACE FUNCTION ");
-                    } else if next_token_trimmed.eq_ignore_ascii_case("VIEW") {
-                        object_type = "view".to_string();
-                        in_object = true;
-                        object_content.push_str("CREATE OR REPLACE VIEW ");
-                    } else if next_token_trimmed.eq_ignore_ascii_case("MATERIALIZED") {
-                        if let Some(view_token) = token_iter.next() {
-                            if view_token.trim().eq_ignore_ascii_case("VIEW") {
-                                object_type = "materialized_view".to_string();
-                                in_object = true;
-                                object_content.push_str("CREATE MATERIALIZED VIEW ");
-                            }
-                        }
-                    } else {
-                        migrations_file_content.push_str(token);
-                        migrations_file_content.push_str(next_token);
-                    }
-
-                    if in_object {
-                        // Extract object name
-                        if let Some(name_token) = token_iter.next() {
-                            let name_block = name_token.to_string();
-                            object_name = name_block
-                                .split(|c| c == '(' || c == ' ')
-                                .next()
-                                .expect("Expected object name")
-                                .to_string();
-                            object_content.push_str(&name_block);
-
-                            // For functions, look for RETURNS and block label
-                            if object_type == "function" {
-                                while let Some(next_token) = token_iter.next() {
-                                    object_content.push_str(next_token);
-                                    if next_token.trim().eq_ignore_ascii_case("RETURNS") {
-                                        let return_statement =
-                                            token_iter.next().unwrap().to_string();
-                                        object_content.push_str(&return_statement);
-                                        if return_statement.trim().eq_ignore_ascii_case("TRIGGER") {
-                                            object_type = "trigger".to_string();
-                                        }
-                                        break;
-                                    }
-                                }
-                                // Look for opening block label
-                                while let Some(next_token) = token_iter.next() {
-                                    object_content.push_str(next_token);
-                                    if next_token.trim().starts_with('$')
-                                        && next_token.trim().ends_with('$')
-                                    {
-                                        block_label = next_token.trim().to_string();
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            } else {
-                migrations_file_content.push_str(token);
-            }
-        } else {
-            object_content.push_str(token);
-            if (object_type == "function" || object_type == "trigger")
-                && token.contains(&block_label)
-            {
-                // Write object to file
-                let folder = if object_type == "function" {
-                    "functions"
-                } else {
-                    "triggers"
-                };
-                let output_path = Path::new(pgm_dir_path)
-                    .join(folder)
-                    .join(format!("{}.sql", object_name));
-                std::fs::write(output_path, &object_content)?;
-
-                // Reset object state
-                in_object = false;
-                object_name.clear();
-                object_content.clear();
-                block_label.clear();
-                object_type.clear();
-            } else if (object_type == "view" || object_type == "materialized_view")
-                && token.trim().ends_with(';')
-            {
-                // Write object to file
-                let output_path = Path::new(pgm_dir_path)
-                    .join("views")
-                    .join(format!("{}.sql", object_name));
-                std::fs::write(output_path, &object_content)?;
-
-                // Reset object state
-                in_object = false;
-                object_name.clear();
-                object_content.clear();
-                block_label.clear();
-                object_type.clear();
-            }
+    let mut child = match ProcessCommand::new("pg_dump")
+        .args(&[
+            "-f",
+            schema_dump_file.path().to_str().unwrap(),
+            "--no-owner",
+            "--schema-only",
+        ])
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(anyhow::anyhow!(
+                "pg_dump not found. Please ensure it is installed and in your PATH."
+            ));
         }
+        Err(e) => return Err(anyhow::anyhow!("Failed to spawn pg_dump: {}", e)),
+    };
+
+    let exit_status = child.wait().context("Failed to wait for pg_dump")?;
+    if !exit_status.success() {
+        return Err(anyhow::anyhow!("pg_dump failed"));
     }
 
-    // Remove all lines starting with -- and other unnecessary lines
-    let migrations_file_content = migrations_file_content
+    // HACK: replace SELECT pg_catalog.set_config('search_path', '', false);
+    let schema_dump_file_content = std::fs::read_to_string(schema_dump_file.path())?;
+    let modified_content = schema_dump_file_content
+        .replace("SELECT pg_catalog.set_config('search_path', '', false);", "PERFORM pg_catalog.set_config('search_path', '', false);");
+    std::fs::write(schema_dump_file.path(), modified_content)?;
+
+    Ok(schema_dump_file)
+}
+
+fn get_triggers_from_db() -> Result<Vec<(String, String)>> {
+    let function_names = ProcessCommand::new("psql")
+        .args(&[
+            "-t",
+            "-c",
+            "SELECT proname AS function_name
+             FROM pg_proc p
+             JOIN pg_namespace n ON p.pronamespace = n.oid
+             LEFT JOIN pg_depend d ON d.objid = p.oid AND d.deptype = 'e'
+             WHERE 
+                n.nspname NOT IN ('pg_catalog', 'information_schema')
+                AND p.prokind = 'f' 
+                AND d.objid IS NULL
+                AND EXISTS (
+                    SELECT 1
+                    FROM pg_trigger t
+                    WHERE t.tgfoid = p.oid
+                )
+             ORDER BY function_name;",
+        ])
+        .output()
+        .context("Failed to execute psql command to get function names")?;
+    let function_names = String::from_utf8(function_names.stdout)
+        .context("Failed to convert function names output to UTF-8")?
         .lines()
-        .filter(|line| !line.starts_with("--"))
-        .filter(|line| !line.starts_with("SET check_function_bodies = false"))
-        .filter(|line| !line.starts_with("SELECT pg_catalog.set_config('search_path'"))
+        .map(|line| line.trim().to_string())
         .filter(|line| !line.is_empty())
-        .collect::<Vec<&str>>()
-        .join("\n");
+        .collect::<Vec<String>>();
 
-    // Write the new file content without functions to a new file
-    let migrations_file_path = Path::new(pgm_dir_path).join("migrations").join("00000.sql");
-    std::fs::write(migrations_file_path, migrations_file_content)?;
+    let processes = function_names.iter().map(|name| {
+        ProcessCommand::new("psql")
+            .args(&[
+                "-t",
+                "-A",
+                "-c",
+                &format!(
+                    "SELECT pg_get_functiondef(p.oid) AS function_definition
+                     FROM pg_proc p
+                     JOIN pg_namespace n ON p.pronamespace = n.oid
+                     WHERE n.nspname = 'public' AND p.proname = '{}';",
+                    name
+                ),
+            ])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .context(format!(
+                "Failed to spawn psql command for function '{}'",
+                name
+            ))
+    });
 
-    Ok(())
+    let function_contents = processes
+        .map(|process| {
+            process.and_then(|child| {
+                child
+                    .wait_with_output()
+                    .context("Failed to wait for psql command output")
+            })
+        })
+        .map(|output| {
+            output.map(|o| {
+                let content = String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .map(|line| line.trim_end())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let content = content.trim_end();
+                format!("{content};")
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .context("Failed to collect function contents")?;
+
+    // Combine function names and contents
+    let functions = function_names
+        .into_iter()
+        .zip(function_contents)
+        .collect::<Vec<_>>();
+
+    Ok(functions)
+}
+
+fn get_functions_from_db() -> Result<Vec<(String, String)>> {
+    let function_names = ProcessCommand::new("psql")
+        .args(&[
+            "-t",
+            "-c",
+            "SELECT DISTINCT proname AS function_name
+             FROM pg_proc p
+             JOIN pg_namespace n ON p.pronamespace = n.oid
+             LEFT JOIN pg_depend d ON d.objid = p.oid AND d.deptype = 'e'
+             WHERE 
+                n.nspname NOT IN ('pg_catalog', 'information_schema')
+                AND p.prokind = 'f' 
+                AND d.objid IS NULL
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM pg_trigger t
+                    WHERE t.tgfoid = p.oid
+                )
+             ORDER BY function_name;",
+        ])
+        .output()
+        .context("Failed to execute psql command to get function names")?;
+    let function_names = String::from_utf8(function_names.stdout)
+        .context("Failed to convert function names output to UTF-8")?
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<String>>();
+
+    let processes = function_names.iter().map(|name| {
+        ProcessCommand::new("psql")
+            .args(&[
+                "-t",
+                "-A",
+                "-c",
+                &format!(
+                    "SELECT RTRIM(pg_get_functiondef(p.oid), E'\n') || ';\n' AS function_definition
+                     FROM pg_proc p
+                     JOIN pg_namespace n ON p.pronamespace = n.oid
+                     WHERE n.nspname = 'public' AND p.proname = '{}';",
+                    name
+                ),
+            ])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .context(format!(
+                "Failed to spawn psql command for function '{}'",
+                name
+            ))
+    });
+
+    let function_contents = processes
+        .map(|process| {
+            process.and_then(|child| {
+                child
+                    .wait_with_output()
+                    .context("Failed to wait for psql command output")
+            })
+        })
+        .map(|output| {
+            output.map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .map(|line| line.trim_end())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .context("Failed to collect function contents")?;
+
+    // Combine function names and contents
+    let functions = function_names
+        .into_iter()
+        .zip(function_contents)
+        .collect::<Vec<_>>();
+
+    Ok(functions)
+}
+
+fn get_views_from_db() -> Result<Vec<(String, String)>> {
+    let view_names = ProcessCommand::new("psql")
+        .args(&[
+            "-t",
+            "-c",
+            "SELECT c.relname AS view_name
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            LEFT JOIN pg_depend d ON d.objid = c.oid AND d.deptype = 'e'
+            WHERE c.relkind = 'v'
+              AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+              AND d.objid IS NULL 
+              AND c.relname NOT LIKE 'pg_%'
+            ORDER BY c.relname;",
+        ])
+        .output()
+        .context("Failed to execute psql command to get view names")?;
+    let view_names = String::from_utf8(view_names.stdout)
+        .context("Failed to convert view names output to UTF-8")?
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<String>>();
+
+    let processes = view_names.iter().map(|name| {
+        ProcessCommand::new("psql")
+            .args(&[
+                "-t",
+                "-A",
+                "-c",
+                &format!("SELECT pg_get_viewdef('{}') AS view_definition;", name),
+            ])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .context(format!("Failed to spawn psql command for view '{}'", name))
+    });
+
+    let view_contents = processes
+        .map(|process| {
+            process.and_then(|child| {
+                child
+                    .wait_with_output()
+                    .context("Failed to wait for psql command output")
+            })
+        })
+        .map(|output| {
+            output.map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .map(|line| line.trim_end())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .context("Failed to collect view contents")?;
+
+    // Combine view names and contents
+    let views = view_names
+        .into_iter()
+        .zip(view_contents)
+        .map(|(name, content)| {
+            let view_definition = format!("CREATE OR REPLACE VIEW {name} AS\n{content}");
+            (name, view_definition)
+        })
+        .collect::<Vec<_>>();
+    Ok(views)
 }
 
 fn initialize(pgm_dir_path: &str, existing_db: bool) -> Result<()> {
@@ -159,40 +286,52 @@ fn initialize(pgm_dir_path: &str, existing_db: bool) -> Result<()> {
     }
 
     if existing_db {
-        // Create temporary file for schema dump
-        let schema_dump_file =
-            NamedTempFile::new().context("Failed to create temporary file for schema dump")?;
+        // Call get_initial_migration_from_db to get schema-only dump
+        let initial_migration_file = get_initial_migration_from_db()?;
 
-        // Call pg_dump to get schema-only dump
-        let output_path = schema_dump_file.path().to_str().unwrap();
-        let mut child = match ProcessCommand::new("pg_dump")
-            .args(&["-f", output_path, "--no-owner", "--schema-only"])
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(anyhow::anyhow!(
-                    "pg_dump not found. Please ensure it is installed and in your PATH."
-                ));
-            }
-            Err(e) => return Err(anyhow::anyhow!("Failed to spawn pg_dump: {}", e)),
-        };
+        // Get functions from the database
+        let functions = get_functions_from_db()?;
 
-        let exit_status = child.wait().context("Failed to wait for pg_dump")?;
-        if !exit_status.success() {
-            return Err(anyhow::anyhow!("pg_dump failed"));
-        }
+        // Get triggers from the database
+        let triggers = get_triggers_from_db()?;
 
-        // Read the schema dump
-        let schema_dump = std::fs::read_to_string(output_path)?;
+        // Get views from the database
+        let views = get_views_from_db()?;
 
         // Create directory structure
         create_directory_structure(pgm_dir_path)?;
 
-        // Extract all functions, triggers, views, and materialized views from schema dump and write them to the appropriate folders
-        // Then create a migration file with the changes
-        parse_schema_dump(pgm_dir_path, &schema_dump)
-            .context("Failed to extract functions, triggers, views, and materialized views")?;
+        // Copy schema dump to migrations directory
+        let migrations_dir = Path::new(pgm_dir_path).join("migrations");
+        std::fs::copy(
+            initial_migration_file,
+            migrations_dir.join(INITIAL_MIGRATION_FILE_NAME),
+        )
+        .context("Failed to copy schema dump to migrations directory")?;
+
+        // Write all function to functions directory
+        let functions_dir = Path::new(pgm_dir_path).join("functions");
+        for (name, content) in functions {
+            let function_file = functions_dir.join(format!("{}.sql", name));
+            std::fs::write(function_file, content)
+                .context(format!("Failed to write function '{}' to file", name))?;
+        }
+
+        // Write all triggers to triggers directory
+        let triggers_dir = Path::new(pgm_dir_path).join("triggers");
+        for (name, content) in triggers {
+            let trigger_file = triggers_dir.join(format!("{}.sql", name));
+            std::fs::write(trigger_file, content)
+                .context(format!("Failed to write trigger '{}' to file", name))?;
+        }
+
+        // Write all views to views directory
+        let views_dir = Path::new(pgm_dir_path).join("views");
+        for (name, content) in views {
+            let view_file = views_dir.join(format!("{}.sql", name));
+            std::fs::write(view_file, content)
+                .context(format!("Failed to write view '{}' to file", name))?;
+        }
     } else {
         // Create directory structure without using pg_dump
         create_directory_structure(pgm_dir_path)?;
@@ -214,7 +353,7 @@ fn create_directory_structure(pgm_dir_path: &str) -> Result<()> {
     Ok(())
 }
 
-fn build(pgm_dir_path: &str) -> Result<String> {
+fn build(pgm_dir_path: &str, minify: bool) -> Result<String> {
     // Check if the postgres directory exists
     if !Path::new(pgm_dir_path).is_dir() {
         return Err(anyhow::anyhow!(
@@ -255,20 +394,40 @@ CREATE TABLE IF NOT EXISTS pgm_view (
     hash TEXT NOT NULL,
     applied_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
-
 "#,
     );
 
     let functions_dir = format!("{}/functions", pgm_dir_path);
     let triggers_dir = format!("{}/triggers", pgm_dir_path);
     let views_dir = format!("{}/views", pgm_dir_path);
+    let migrations_dir = format!("{}/migrations", pgm_dir_path);
+
+    let initial_migration_file =
+        Path::new(migrations_dir.as_str()).join(INITIAL_MIGRATION_FILE_NAME);
+
+    let mut migration_files: Vec<_> = std::fs::read_dir(migrations_dir.as_str())?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry.path().is_file() && entry.path().extension().map_or(false, |ext| ext == "sql")
+        })
+        // filter out initial migration file
+        .filter(|entry| {
+            entry.path().file_name().expect("Filename must exist") != INITIAL_MIGRATION_FILE_NAME
+        })
+        .collect();
+    migration_files.sort_by_key(|entry| entry.file_name());
+
+    // Always execute the initial migrations first
+    compiled_content.push_str(&process_migration(&initial_migration_file)?);
 
     // Add all the content to the compiled SQL file, the hash is not updated here because we will update it below (where we also check the function body)
     compiled_content.push_str(&process_directory(&functions_dir, "pgm_function", false)?);
     compiled_content.push_str(&process_directory(&triggers_dir, "pgm_trigger", false)?);
 
     // Add the migrations and views
-    compiled_content.push_str(&process_migrations(pgm_dir_path)?);
+    for file in migration_files {
+        compiled_content.push_str(&process_migration(&file.path())?);
+    }
     compiled_content.push_str(&process_directory(&views_dir, "pgm_view", true)?);
 
     // At this point we already know that tables/functions/triggers/views are created
@@ -279,6 +438,22 @@ CREATE TABLE IF NOT EXISTS pgm_view (
 
     // End the main DO block
     compiled_content.push_str("END $pgm$;\n");
+
+    // Remove empty lines
+    compiled_content = compiled_content
+            .lines()
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+    // Remove comments
+    if minify {
+        compiled_content = compiled_content
+            .lines()
+            .filter(|line| !line.starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
 
     Ok(compiled_content)
 }
@@ -298,7 +473,11 @@ fn process_directory(full_dir_path: &str, table: &str, update_table_hash: bool) 
 
             let update_hash_query = if update_table_hash {
                 format!(
-                    "INSERT INTO {table} (name, hash) VALUES ('{file_name}', '{hash}') ON CONFLICT (name) DO UPDATE SET hash = EXCLUDED.hash, applied_at = CURRENT_TIMESTAMP;"
+                    "
+    INSERT INTO {table} (name, hash) VALUES ('{file_name}', '{hash}') ON CONFLICT (name) DO UPDATE SET hash = EXCLUDED.hash, applied_at = CURRENT_TIMESTAMP;
+    RAISE NOTICE 'Applied {file_path}';
+ELSE
+    RAISE NOTICE 'Skipped {file_path} (no changes)';"
                 )
             } else {
                 String::new()
@@ -308,15 +487,9 @@ fn process_directory(full_dir_path: &str, table: &str, update_table_hash: bool) 
                 "-- RUN {file_path} --
 IF (SELECT hash FROM {table} WHERE name = '{file_name}') IS DISTINCT FROM '{hash}' THEN
 {content}
-
 {update_hash_query}
-
-    RAISE NOTICE 'Applied {file_path}';
-ELSE
-    RAISE NOTICE 'Skipped {file_path} (no changes)';
 END IF;
 -- DONE {file_path} --
-
 "
             ));
         }
@@ -324,42 +497,31 @@ END IF;
     Ok(compiled_content)
 }
 
-fn process_migrations(pgm_dir_path: &str) -> Result<String> {
-    let migrations_dir = format!("{}/migrations", pgm_dir_path);
-    let migrations_dir = migrations_dir.as_str();
-    let mut migration_files: Vec<_> = std::fs::read_dir(migrations_dir)?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| {
-            entry.path().is_file() && entry.path().extension().map_or(false, |ext| ext == "sql")
-        })
-        .collect();
-
-    migration_files.sort_by_key(|entry| entry.file_name());
-
+fn process_migration(path: &Path) -> Result<String> {
     let mut compiled_content = String::new();
-    for entry in migration_files {
-        let path = entry.path();
-        let content = std::fs::read_to_string(&path)?;
 
-        let file_name = path.file_stem().unwrap().to_str().unwrap();
+    let content = std::fs::read_to_string(path)?;
 
-        let file_path = format!("{}/{}.sql", &migrations_dir, file_name);
+    let file_name = path.file_stem().unwrap().to_str().unwrap();
+    let path_with_extension = path
+        .file_name()
+        .expect("File name should exist")
+        .to_str()
+        .expect("Should be a string");
 
-        compiled_content.push_str(&format!(
-            "-- RUN {file_path} --
-IF NOT EXISTS (SELECT 1 FROM pgm_migration WHERE name = '{file_path}') THEN
+    compiled_content.push_str(&format!(
+        "-- RUN {path_with_extension} --
+IF NOT EXISTS (SELECT 1 FROM pgm_migration WHERE name = '{file_name}') THEN
 {content}
-
-INSERT INTO pgm_migration (name) VALUES ('{file_path}');
-RAISE NOTICE 'Applied migration: {file_path}';
+INSERT INTO pgm_migration (name) VALUES ('{file_name}');
+RAISE NOTICE 'Applied migration: {file_name}';
 ELSE
-RAISE NOTICE 'Skipped migration: {file_path} (already applied)';
+RAISE NOTICE 'Skipped migration: {file_name} (already applied)';
 END IF;
--- DONE {file_path} --
-
+-- DONE {path_with_extension} --
 "
-        ));
-    }
+    ));
+
     Ok(compiled_content)
 }
 
@@ -448,7 +610,7 @@ fn apply(pgm_dir_path: &str, dry_run: bool, fake: bool) -> Result<()> {
     let sql = if fake {
         build_fake(pgm_dir_path).expect("Failed to compile fake SQL")
     } else {
-        build(pgm_dir_path).expect("Failed to compile SQL")
+        build(pgm_dir_path, !dry_run).expect("Failed to compile SQL")
     };
 
     // Print the SQL and exit if dry-run
@@ -487,28 +649,22 @@ fn execute_sql(sql: &str) -> Result<()> {
         "ON_ERROR_STOP=1",
     ]);
 
-    // Execute the psql command
-    match command.output() {
-        Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
+    let output = command.output().context("Failed to execute psql command")?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    
+    // Process stderr to remove prefix 'psql:/path/to/temp/file:1234: '
+    stderr.lines().for_each(|line| {
+        println!("{}", line.split_once(": ").map_or(line, |(_, rest)| rest));
+    });
 
-            // Process stderr and stdout to remove prefix 'psql:/path/to/temp/file:1234: '
-            stderr.lines().chain(stdout.lines()).for_each(|line| {
-                println!("{}", line.split_once(": ").map_or(line, |(_, rest)| rest));
-            });
-
-            if output.status.success() {
-                Ok(())
-            } else {
-                let exit_code = output.status.code().unwrap_or(-1);
-                Err(anyhow::anyhow!(
-                    "psql command failed with exit code: {}",
-                    exit_code
-                ))
-            }
-        }
-        Err(e) => Err(anyhow::anyhow!("Failed to execute psql command: {}.", e)),
+    if output.status.success() {
+        Ok(())
+    } else {
+        let exit_code = output.status.code().unwrap_or(-1);
+        Err(anyhow::anyhow!(
+            "psql command failed with exit code: {}",
+            exit_code
+        ))
     }
 }
 
@@ -612,7 +768,7 @@ fn create_trigger(pgm_dir_path: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn create_view(pgm_dir_path: &str, name: &str, materialized: bool) -> Result<()> {
+fn create_view(pgm_dir_path: &str, name: &str) -> Result<()> {
     if !Path::new(pgm_dir_path).exists() {
         return Err(anyhow::anyhow!(
             "Directory '{}' not found. Have you run 'pgm init'?",
@@ -641,37 +797,16 @@ fn create_view(pgm_dir_path: &str, name: &str, materialized: bool) -> Result<()>
         }
     }
 
-    let template_name = if materialized {
-        "./src/templates/materialized_view.sql"
-    } else {
-        "./src/templates/view.sql"
-    };
+    let template_name = "./src/templates/view.sql";
 
     let template =
         std::fs::read_to_string(template_name).context("Failed to read view template")?;
-    let rand_hash1 = format!(
-        "{:x}",
-        md5::compute(std::time::Instant::now().elapsed().as_secs().to_string())
-    );
-    let rand_hash2 = format!(
-        "{:x}",
-        md5::compute(std::time::Instant::now().elapsed().as_secs().to_string())
-    );
-    let content = template
-        .replace("<name_placeholder>", name)
-        .replace("<random_hash1>", &rand_hash1)
-        .replace("<random_hash2>", &rand_hash2);
+
+    let content = template.replace("<name_placeholder>", name);
     std::fs::write(file_path, content).context("Failed to create view file")?;
 
-    println!(
-        "{} '{}' created successfully",
-        if materialized {
-            "Materialized view"
-        } else {
-            "View"
-        },
-        name
-    );
+    println!("View '{name}' created successfully");
+
     Ok(())
 }
 
@@ -771,23 +906,6 @@ fn main() {
                         ),
                 )
                 .subcommand(
-                    Command::new("materialized-view")
-                        .about("Creates a new materialized view")
-                        .arg(
-                            Arg::new("path")
-                                .long("path")
-                                .help("The path to the directory containing the database files")
-                                .default_value(DEFAULT_PGM_PATH)
-                                .value_parser(clap::value_parser!(String)),
-                        )
-                        .arg(
-                            Arg::new("name")
-                                .help("The name of the materialized view")
-                                .required(true)
-                                .value_parser(clap::value_parser!(String)),
-                        ),
-                )
-                .subcommand(
                     Command::new("function")
                         .about("Creates a new function")
                         .arg(
@@ -813,7 +931,10 @@ fn main() {
                 .expect("Input argument is required");
             let existing_db = init_matches.get_flag("existing-db");
             if let Err(e) = initialize(path, existing_db) {
-                eprintln!("Error during initialization: {}", e);
+                eprintln!("Error during initialization:");
+                for cause in e.chain() {
+                    eprintln!("  - {}", cause);
+                }
             } else {
                 println!("Initialized successfully");
             }
@@ -831,7 +952,12 @@ fn main() {
                         println!("Changes applied successfully");
                     }
                 }
-                Err(e) => eprintln!("Error applying changes: {}", e),
+                Err(e) => {
+                    eprintln!("Error applying changes:");
+                    for cause in e.chain() {
+                        eprintln!("  - {}", cause);
+                    }
+                }
             }
         }
         Some(("create", create_matches)) => match create_matches.subcommand() {
@@ -840,7 +966,10 @@ fn main() {
                     .get_one::<String>("path")
                     .expect("Input argument is required");
                 if let Err(e) = create_migration(path) {
-                    eprintln!("Error during migration creation: {}", e);
+                    eprintln!("Error during migration creation:");
+                    for cause in e.chain() {
+                        eprintln!("  - {}", cause);
+                    }
                 } else {
                     println!("Migration created successfully");
                 }
@@ -853,7 +982,10 @@ fn main() {
                     .get_one::<String>("name")
                     .expect("Name argument is required");
                 if let Err(e) = create_trigger(path, name) {
-                    eprintln!("Error during trigger creation: {}", e);
+                    eprintln!("Error during trigger creation:");
+                    for cause in e.chain() {
+                        eprintln!("  - {}", cause);
+                    }
                 }
             }
             Some(("view", view_matches)) => {
@@ -864,20 +996,11 @@ fn main() {
                     .get_one::<String>("name")
                     .expect("Name argument is required");
 
-                if let Err(e) = create_view(path, name, false) {
-                    eprintln!("Error during view creation: {}", e);
-                }
-            }
-            Some(("materialized-view", view_matches)) => {
-                let path = view_matches
-                    .get_one::<String>("path")
-                    .expect("Input argument is required");
-                let name = view_matches
-                    .get_one::<String>("name")
-                    .expect("Name argument is required");
-
-                if let Err(e) = create_view(path, name, true) {
-                    eprintln!("Error during materialized view creation: {}", e);
+                if let Err(e) = create_view(path, name) {
+                    eprintln!("Error during view creation:");
+                    for cause in e.chain() {
+                        eprintln!("  - {}", cause);
+                    }
                 }
             }
             Some(("function", function_matches)) => {
@@ -889,7 +1012,10 @@ fn main() {
                     .expect("Name argument is required");
 
                 if let Err(e) = create_function(path, name) {
-                    eprintln!("Error during function creation: {}", e);
+                    eprintln!("Error during function creation:");
+                    for cause in e.chain() {
+                        eprintln!("  - {}", cause);
+                    }
                 }
             }
             _ => {}

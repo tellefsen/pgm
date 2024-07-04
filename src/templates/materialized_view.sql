@@ -1,6 +1,0 @@
-CREATE MATERIALIZED VIEW <random_hash1> AS
-SELECT 1;
-
-ALTER MATERIALIZED VIEW IF EXISTS <name_placeholder> RENAME TO <random_hash2>;
-ALTER MATERIALIZED VIEW <random_hash1> RENAME TO <name_placeholder>;
-DROP MATERIALIZED VIEW IF EXISTS <random_hash2>;
