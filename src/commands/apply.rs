@@ -66,8 +66,8 @@ fn execute_sql(sql: &str) -> Result<()> {
     }
 }
 
-fn pgm_tables_create_sql(_pgm_dir_path: &str) -> Result<String> {
-    Ok(String::from(
+fn pgm_tables_create_sql() -> String {
+    String::from(
         r#"
 -- Create tables if they don't exist
 CREATE TABLE IF NOT EXISTS pgm_migration (
@@ -93,7 +93,7 @@ CREATE TABLE IF NOT EXISTS pgm_view (
     applied_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 "#,
-    ))
+    )
 }
 
 fn build(pgm_dir_path: &str, minify: bool) -> Result<String> {
@@ -113,9 +113,7 @@ fn build(pgm_dir_path: &str, minify: bool) -> Result<String> {
     compiled_content.push_str("SET LOCAL client_min_messages = notice;\n");
 
     // Add schema creation with existence check
-    compiled_content.push_str(
-        &pgm_tables_create_sql(pgm_dir_path).context("Failed to create pgm tables query")?,
-    );
+    compiled_content.push_str(&pgm_tables_create_sql());
 
     let functions_dir = format!("{}/functions", pgm_dir_path);
     let triggers_dir = format!("{}/triggers", pgm_dir_path);
@@ -259,9 +257,7 @@ fn build_fake(pgm_dir_path: &str) -> Result<String> {
     // Start the main DO block
     compiled_content.push_str("DO $pgm$ BEGIN\n");
 
-    compiled_content.push_str(
-        &pgm_tables_create_sql(pgm_dir_path).context("Failed to create pgm tables query")?,
-    );
+    compiled_content.push_str(&pgm_tables_create_sql());
 
     let functions_content =
         process_directory_fake(&format!("{}/functions", pgm_dir_path), "pgm_function")?;
