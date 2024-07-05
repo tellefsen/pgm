@@ -66,24 +66,8 @@ fn execute_sql(sql: &str) -> Result<()> {
     }
 }
 
-fn build(pgm_dir_path: &str, minify: bool) -> Result<String> {
-    // Check if the postgres directory exists
-    if !Path::new(pgm_dir_path).is_dir() {
-        return Err(anyhow::anyhow!(
-            "Directory '{}' not found. Have you run 'pgm init'?",
-            pgm_dir_path
-        ));
-    }
-
-    let mut compiled_content = String::new();
-
-    // Start the main DO block
-    compiled_content.push_str("DO $pgm$ BEGIN\n");
-    compiled_content.push_str("SET LOCAL check_function_bodies = false;\n");
-    compiled_content.push_str("SET LOCAL client_min_messages = notice;\n");
-
-    // Add schema creation with existence check
-    compiled_content.push_str(
+fn pgm_tables_create_sql(_pgm_dir_path: &str) -> Result<String> {
+    Ok(String::from(
         r#"
 -- Create tables if they don't exist
 CREATE TABLE IF NOT EXISTS pgm_migration (
@@ -109,6 +93,28 @@ CREATE TABLE IF NOT EXISTS pgm_view (
     applied_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 "#,
+    ))
+}
+
+fn build(pgm_dir_path: &str, minify: bool) -> Result<String> {
+    // Check if the postgres directory exists
+    if !Path::new(pgm_dir_path).is_dir() {
+        return Err(anyhow::anyhow!(
+            "Directory '{}' not found. Have you run 'pgm init'?",
+            pgm_dir_path
+        ));
+    }
+
+    let mut compiled_content = String::new();
+
+    // Start the main DO block
+    compiled_content.push_str("DO $pgm$ BEGIN\n");
+    compiled_content.push_str("SET LOCAL check_function_bodies = false;\n");
+    compiled_content.push_str("SET LOCAL client_min_messages = notice;\n");
+
+    // Add schema creation with existence check
+    compiled_content.push_str(
+        &pgm_tables_create_sql(pgm_dir_path).context("Failed to create pgm tables query")?,
     );
 
     let functions_dir = format!("{}/functions", pgm_dir_path);
@@ -252,6 +258,10 @@ fn build_fake(pgm_dir_path: &str) -> Result<String> {
 
     // Start the main DO block
     compiled_content.push_str("DO $pgm$ BEGIN\n");
+
+    compiled_content.push_str(
+        &pgm_tables_create_sql(pgm_dir_path).context("Failed to create pgm tables query")?,
+    );
 
     let functions_content =
         process_directory_fake(&format!("{}/functions", pgm_dir_path), "pgm_function")?;
