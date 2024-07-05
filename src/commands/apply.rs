@@ -7,7 +7,6 @@ use tempfile::NamedTempFile;
 
 use crate::INITIAL_MIGRATION_FILE_NAME;
 
-
 pub fn apply(pgm_dir_path: &str, dry_run: bool, fake: bool) -> Result<()> {
     // Compile the SQL
     let sql = if fake {
@@ -54,7 +53,7 @@ fn execute_sql(sql: &str) -> Result<()> {
 
     let output = command.output().context("Failed to execute psql command")?;
     let stderr = String::from_utf8_lossy(&output.stderr);
-    
+
     // Process stderr to remove prefix 'psql:/path/to/temp/file:1234: '
     stderr.lines().for_each(|line| {
         println!("{}", line.split_once(": ").map_or(line, |(_, rest)| rest));
@@ -71,7 +70,6 @@ fn execute_sql(sql: &str) -> Result<()> {
     }
 }
 
-
 fn build(pgm_dir_path: &str, minify: bool) -> Result<String> {
     // Check if the postgres directory exists
     if !Path::new(pgm_dir_path).is_dir() {
@@ -86,6 +84,7 @@ fn build(pgm_dir_path: &str, minify: bool) -> Result<String> {
     // Start the main DO block
     compiled_content.push_str("DO $pgm$ BEGIN\n");
     compiled_content.push_str("SET LOCAL check_function_bodies = false;\n");
+    compiled_content.push_str("SET LOCAL client_min_messages = notice;\n");
 
     // Add schema creation with existence check
     compiled_content.push_str(
@@ -160,10 +159,10 @@ CREATE TABLE IF NOT EXISTS pgm_view (
 
     // Remove empty lines
     compiled_content = compiled_content
-            .lines()
-            .filter(|line| !line.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
+        .lines()
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
 
     // Remove comments
     if minify {
@@ -194,9 +193,9 @@ fn process_directory(full_dir_path: &str, table: &str, update_table_hash: bool) 
                 format!(
                     "
     INSERT INTO {table} (name, hash) VALUES ('{file_name}', '{hash}') ON CONFLICT (name) DO UPDATE SET hash = EXCLUDED.hash, applied_at = CURRENT_TIMESTAMP;
-    RAISE NOTICE 'Applied {file_path}';
+    RAISE NOTICE '✅ Applied {file_path}';
 ELSE
-    RAISE NOTICE 'Skipped {file_path} (no changes)';"
+    RAISE NOTICE '- Skipped {file_path} (no changes)';"
                 )
             } else {
                 String::new()
@@ -233,9 +232,9 @@ fn process_migration(path: &Path) -> Result<String> {
 IF NOT EXISTS (SELECT 1 FROM pgm_migration WHERE name = '{file_name}') THEN
 {content}
 INSERT INTO pgm_migration (name) VALUES ('{file_name}');
-RAISE NOTICE 'Applied migration: {file_name}';
+RAISE NOTICE '✅ Applied migration: {file_name}';
 ELSE
-RAISE NOTICE 'Skipped migration: {file_name} (already applied)';
+RAISE NOTICE '- Skipped migration: {file_name} (already applied)';
 END IF;
 -- DONE {path_with_extension} --
 "
@@ -291,7 +290,7 @@ fn process_directory_fake(full_dir_path: &str, table: &str) -> Result<String> {
                 "-- Fake apply {table} '{file_name}'
 INSERT INTO {table} (name, hash) VALUES ('{file_name}', '{hash}') 
                 ON CONFLICT (name) DO UPDATE SET hash = EXCLUDED.hash, applied_at = CURRENT_TIMESTAMP;
-                RAISE NOTICE 'Fake applied: {table} - {file_name}';\n"
+                RAISE NOTICE '✅Fake applied: {table} - {file_name}';\n"
             ));
         }
     }
@@ -318,7 +317,7 @@ fn process_migrations_fake(pgm_dir_path: &str) -> Result<String> {
         compiled_content.push_str(&format!(
             "-- Fake apply migration '{file_name}'
 INSERT INTO pgm_migration (name) VALUES ('{file_name}') ON CONFLICT (name) DO NOTHING;
-            RAISE NOTICE 'Fake applied migration: {file_name}';\n"
+            RAISE NOTICE '✅ Fake applied migration: {file_name}';\n"
         ));
     }
     Ok(compiled_content)

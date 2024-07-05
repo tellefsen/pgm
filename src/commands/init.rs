@@ -49,7 +49,8 @@ fn get_initial_migration_from_db() -> Result<NamedTempFile> {
     // HACK: replace SELECT pg_catalog.set_config('search_path', '', false);
     let schema_dump_file_content = std::fs::read_to_string(schema_dump_file.path())?;
     let modified_content = schema_dump_file_content
-        .replace("SELECT pg_catalog.set_config('search_path', '', false);", "PERFORM pg_catalog.set_config('search_path', '', false);");
+        .replace("SELECT pg_catalog.set_config('search_path', '', false);", "PERFORM pg_catalog.set_config('search_path', '', false);")
+        .replace("SET client_min_messages = warning;", "SET client_min_messages = notice;");
     std::fs::write(schema_dump_file.path(), modified_content)?;
 
     Ok(schema_dump_file)
