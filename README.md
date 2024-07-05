@@ -1,11 +1,11 @@
 # pgm
 
-A command-line tool for managing PostgreSQL migrations, functions, triggers, and views.
+A command-line tool for managing PostgreSQL migrations, functions, triggers, views, and seeds.
 
 ## Features
 
 - Initialize projects
-- Manage migrations, functions, triggers, and views
+- Manage migrations, functions, triggers, views, and seeds
 - Apply changes with dry-run option
 
 ## Installation
@@ -42,6 +42,12 @@ pgm create migration [--path <path>]
 pgm create trigger <name> [--path <path>]
 pgm create view <name> [--path <path>]
 pgm create function <name> [--path <path>]
+pgm create seed [--path <path>]
+```
+
+### Seed the database
+```
+pgm seed [--path <path>]
 ```
 
 ### Environment Variables
