@@ -292,7 +292,7 @@ fn process_directory_fake(full_dir_path: &str, table: &str) -> Result<String> {
                 "-- Fake apply {table} '{file_name}'
 INSERT INTO {table} (name, hash) VALUES ('{file_name}', '{hash}') 
                 ON CONFLICT (name) DO UPDATE SET hash = EXCLUDED.hash, applied_at = CURRENT_TIMESTAMP;
-                RAISE NOTICE '✅Fake applied: {table} - {file_name}';\n"
+                RAISE NOTICE '✅ Fake applied: {table} - {file_name}';\n"
             ));
         }
     }
