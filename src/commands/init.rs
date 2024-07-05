@@ -15,6 +15,8 @@ fn create_directory_structure(pgm_dir_path: &str) -> Result<()> {
         .context("Failed to create views directory")?;
     std::fs::create_dir_all(format!("{}/functions", pgm_dir_path))
         .context("Failed to create functions directory")?;
+    std::fs::create_dir_all(format!("{}/seeds", pgm_dir_path))
+        .context("Failed to create seeds directory")?;
     Ok(())
 }
 

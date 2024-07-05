@@ -56,6 +56,17 @@ fn main() {
                 ),
         )
         .subcommand(
+            Command::new("seed")
+                .about("Seeds the database with data")
+                .arg(
+                    Arg::new("path")
+                        .long("path")
+                        .help("The path to the directory containing the database files")
+                        .default_value(DEFAULT_PGM_PATH)
+                        .value_parser(clap::value_parser!(String)),
+                ),
+        )
+        .subcommand(
             Command::new("create")
                 .about("Creates a new database object")
                 .subcommand_required(true)
@@ -120,6 +131,15 @@ fn main() {
                                 .required(true)
                                 .value_parser(clap::value_parser!(String)),
                         ),
+                )
+                .subcommand(
+                    Command::new("seed").about("Creates a new seed").arg(
+                        Arg::new("path")
+                            .long("path")
+                            .help("The path to the directory containing the database files")
+                            .default_value(DEFAULT_PGM_PATH)
+                            .value_parser(clap::value_parser!(String)),
+                    ),
                 ),
         )
         .get_matches();
@@ -218,8 +238,34 @@ fn main() {
                     }
                 }
             }
+            Some(("seed", seed_matches)) => {
+                let path = seed_matches
+                    .get_one::<String>("path")
+                    .expect("Input argument is required");
+                if let Err(e) = commands::create_seed(path) {
+                    eprintln!("Error during seed creation:");
+                    for cause in e.chain() {
+                        eprintln!("  - {}", cause);
+                    }
+                } else {
+                    println!("Seed created successfully");
+                }
+            }
             _ => {}
         },
+        Some(("seed", seed_matches)) => {
+            let path = seed_matches
+                .get_one::<String>("path")
+                .expect("Input argument is required");
+            if let Err(e) = commands::seed(path) {
+                eprintln!("Error seeding database:");
+                for cause in e.chain() {
+                    eprintln!("  - {}", cause);
+                }
+            } else {
+                println!("Database seeded successfully");
+            }
+        }
         _ => {}
     }
 }

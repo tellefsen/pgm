@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use md5;
 use std::io::Write;
 use std::path::Path;
-use std::process::Command as ProcessCommand;
+use std::process::Command;
 use tempfile::NamedTempFile;
 
 use crate::INITIAL_MIGRATION_FILE_NAME;
@@ -26,11 +26,7 @@ pub fn apply(pgm_dir_path: &str, dry_run: bool, fake: bool) -> Result<()> {
 
 fn execute_sql(sql: &str) -> Result<()> {
     // Check if psql exists
-    if !ProcessCommand::new("psql")
-        .arg("--version")
-        .output()
-        .is_ok()
-    {
+    if !Command::new("psql").arg("--version").output().is_ok() {
         return Err(anyhow::anyhow!(
             "psql not found. Please ensure it is installed and in your PATH."
         ));
@@ -43,7 +39,7 @@ fn execute_sql(sql: &str) -> Result<()> {
         .context("Failed to write SQL to temporary file")?;
 
     // Construct the psql command
-    let mut command = ProcessCommand::new("psql");
+    let mut command = Command::new("psql");
     command.args(&[
         "-f",
         temp_file.path().to_str().unwrap(),
