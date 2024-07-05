@@ -44,6 +44,33 @@ pgm create view <name> [--path <path>]
 pgm create function <name> [--path <path>]
 ```
 
+### Environment Variables
+
+pgm uses environment variables for database connection. You can set these in three ways:
+
+1. Directly in your shell:
+   ```bash
+   export PGHOST=localhost
+   export PGPORT=5432
+   # ... other variables ...
+   ```
+
+2. Using a `.env` file in your project root:
+   ```
+   PGHOST=localhost
+   PGPORT=5432
+   # ... other variables ...
+   ```
+
+   pgm will automatically load variables from a `.env` file if present.
+
+3. Prepending to the pgm command:
+   ```bash
+   PGUSER=myuser pgm apply
+   ```
+
+   This method allows you to set or override environment variables for a single command execution.
+
 ## Project Structure
 ```
 postgres/

@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.86"
 clap = "4.5.8"
+dotenv = "0.15.0"
 md5 = "0.7.0"
 postgres = "0.19.7"
 tempfile = "3.10.1"

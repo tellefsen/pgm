@@ -1,11 +1,15 @@
 mod commands;
 
 use clap::{Arg, Command};
+use dotenv::dotenv;
 
 const DEFAULT_PGM_PATH: &str = "postgres";
 const INITIAL_MIGRATION_FILE_NAME: &str = "00000.sql";
 
 fn main() {
+    // Load environment variables from .env file
+    dotenv().ok();
+
     let matches = Command::new("pgm")
         .version(env!("CARGO_PKG_VERSION"))
         .arg_required_else_help(true)
