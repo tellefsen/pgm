@@ -26,7 +26,13 @@ curl -sSL "$RELEASE_URL" -o pgm
 # Make it executable
 chmod +x pgm
 
-# Move to a directory in PATH
-sudo mv pgm /usr/local/bin/
+# Check if running in Docker
+if [ -f /.dockerenv ]; then
+    # In Docker, don't use sudo
+    mv pgm /usr/local/bin/
+else
+    # Not in Docker, use sudo
+    sudo mv pgm /usr/local/bin/
+fi
 
 echo "pgm has been installed successfully!"
