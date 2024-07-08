@@ -26,12 +26,12 @@ curl -sSL "$RELEASE_URL" -o pgm
 # Make it executable
 chmod +x pgm
 
-# Check if running in Docker
-if [ -f /.dockerenv ]; then
-    # In Docker, don't use sudo
+# Move the binary to /usr/local/bin/
+if [ -f /.dockerenv ] || [ "$EUID" -eq 0 ]; then
+    # In Docker or running as root, don't use sudo
     mv pgm /usr/local/bin/
 else
-    # Not in Docker, use sudo
+    # Not in Docker and not root, use sudo
     sudo mv pgm /usr/local/bin/
 fi
 
