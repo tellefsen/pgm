@@ -135,8 +135,10 @@ fn build(pgm_dir_path: &str, minify: bool) -> Result<String> {
         .collect();
     migration_files.sort_by_key(|entry| entry.file_name());
 
-    // Always execute the initial migrations first
-    compiled_content.push_str(&process_migration(&initial_migration_file)?);
+    // Execute the initial migration if it exists
+    if initial_migration_file.exists() {
+        compiled_content.push_str(&process_migration(&initial_migration_file)?);
+    }
 
     // Add all the content to the compiled SQL file, the hash is not updated here because we will update it below (where we also check the function body)
     compiled_content.push_str(&process_directory(&functions_dir, "pgm_function", false)?);
