@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use md5;
 use std::io::Write;
 use std::path::Path;
@@ -33,10 +33,10 @@ fn execute_sql(sql: &str) -> Result<()> {
     }
 
     // Create a temporary file
-    let mut temp_file = NamedTempFile::new().context("Failed to create temporary file")?;
+    let mut temp_file = NamedTempFile::new().expect("Failed to create temporary file");
     temp_file
         .write_all(sql.as_bytes())
-        .context("Failed to write SQL to temporary file")?;
+        .expect("Failed to write SQL to temporary file");
 
     // Construct the psql command
     let mut command = Command::new("psql");
@@ -47,7 +47,7 @@ fn execute_sql(sql: &str) -> Result<()> {
         "ON_ERROR_STOP=1",
     ]);
 
-    let output = command.output().context("Failed to execute psql command")?;
+    let output = command.output().expect("Failed to execute psql command");
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     // Process stderr to remove prefix 'psql:/path/to/temp/file:1234: '
@@ -120,41 +120,63 @@ fn build(pgm_dir_path: &str, minify: bool) -> Result<String> {
     let views_dir = format!("{}/views", pgm_dir_path);
     let migrations_dir = format!("{}/migrations", pgm_dir_path);
 
-    let initial_migration_file =
-        Path::new(migrations_dir.as_str()).join(INITIAL_MIGRATION_FILE_NAME);
-
-    let mut migration_files: Vec<_> = std::fs::read_dir(migrations_dir.as_str())?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| {
-            entry.path().is_file() && entry.path().extension().map_or(false, |ext| ext == "sql")
-        })
-        // filter out initial migration file
-        .filter(|entry| {
-            entry.path().file_name().expect("Filename must exist") != INITIAL_MIGRATION_FILE_NAME
-        })
-        .collect();
-    migration_files.sort_by_key(|entry| entry.file_name());
-
-    // Execute the initial migration if it exists
+    // Process initial migration if it exists
+    let initial_migration_file = Path::new(&migrations_dir).join(INITIAL_MIGRATION_FILE_NAME);
     if initial_migration_file.exists() {
         compiled_content.push_str(&process_migration(&initial_migration_file)?);
     }
 
-    // Add all the content to the compiled SQL file, the hash is not updated here because we will update it below (where we also check the function body)
-    compiled_content.push_str(&process_directory(&functions_dir, "pgm_function", false)?);
-    compiled_content.push_str(&process_directory(&triggers_dir, "pgm_trigger", false)?);
-
-    // Add the migrations and views
-    for file in migration_files {
-        compiled_content.push_str(&process_migration(&file.path())?);
+    // Process functions if directory exists
+    if Path::new(&functions_dir).is_dir() {
+        compiled_content.push_str(&process_directory(&functions_dir, "pgm_function", false)?);
     }
-    compiled_content.push_str(&process_directory(&views_dir, "pgm_view", true)?);
+    // Process triggers if directory exists
+    if Path::new(&triggers_dir).is_dir() {
+        compiled_content.push_str(&process_directory(&triggers_dir, "pgm_trigger", false)?);
+    }
 
-    // At this point we already know that tables/functions/triggers/views are created
-    // However we must check the function bodies (since the check was turned off above)
+    // Process migrations if directory exists
+    if Path::new(&migrations_dir).is_dir() {
+        let mut migration_files: Vec<_> = std::fs::read_dir(&migrations_dir)?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry.path().is_file() && entry.path().extension().map_or(false, |ext| ext == "sql")
+            })
+            // filter out initial migration file
+            .filter(|entry| {
+                entry.path().file_name().expect("Filename must exist")
+                    != INITIAL_MIGRATION_FILE_NAME
+            })
+            .collect();
+        migration_files.sort_by_key(|entry| entry.file_name());
+
+        for file in migration_files {
+            compiled_content
+                .push_str(&process_migration(&file.path()).expect("Failed to process migration"));
+        }
+    }
+
+    // Process views if directory exists
+    if Path::new(&views_dir).is_dir() {
+        compiled_content.push_str(
+            &process_directory(&views_dir, "pgm_view", true).expect("Failed to process views"),
+        );
+    }
+
+    // Check function bodies
     compiled_content.push_str("SET LOCAL check_function_bodies = true;\n");
-    compiled_content.push_str(&process_directory(&functions_dir, "pgm_function", true)?);
-    compiled_content.push_str(&process_directory(&triggers_dir, "pgm_trigger", true)?);
+    if Path::new(&functions_dir).is_dir() {
+        compiled_content.push_str(
+            &process_directory(&functions_dir, "pgm_function", true)
+                .expect("Failed to process functions"),
+        );
+    }
+    if Path::new(&triggers_dir).is_dir() {
+        compiled_content.push_str(
+            &process_directory(&triggers_dir, "pgm_trigger", true)
+                .expect("Failed to process triggers"),
+        );
+    }
 
     // End the main DO block
     compiled_content.push_str("END $pgm$;\n");
@@ -261,18 +283,35 @@ fn build_fake(pgm_dir_path: &str) -> Result<String> {
 
     compiled_content.push_str(&pgm_tables_create_sql());
 
-    let functions_content =
-        process_directory_fake(&format!("{}/functions", pgm_dir_path), "pgm_function")?;
-    let triggers_content =
-        process_directory_fake(&format!("{}/triggers", pgm_dir_path), "pgm_trigger")?;
-    let views_content = process_directory_fake(&format!("{}/views", pgm_dir_path), "pgm_view")?;
-    let migrations_content = process_migrations_fake(pgm_dir_path)?;
+    // Process functions if directory exists
+    if Path::new(&format!("{}/functions", pgm_dir_path)).is_dir() {
+        let functions_content =
+            process_directory_fake(&format!("{}/functions", pgm_dir_path), "pgm_function")
+                .expect("Failed to process functions");
+        compiled_content.push_str(&functions_content);
+    }
 
-    // Process directories and migrations, but only update pgm_ tables
-    compiled_content.push_str(&functions_content);
-    compiled_content.push_str(&triggers_content);
-    compiled_content.push_str(&views_content);
-    compiled_content.push_str(&migrations_content);
+    // Process triggers if directory exists
+    if Path::new(&format!("{}/triggers", pgm_dir_path)).is_dir() {
+        let triggers_content =
+            process_directory_fake(&format!("{}/triggers", pgm_dir_path), "pgm_trigger")
+                .expect("Failed to process triggers");
+        compiled_content.push_str(&triggers_content);
+    }
+
+    // Process views if directory exists
+    if Path::new(&format!("{}/views", pgm_dir_path)).is_dir() {
+        let views_content = process_directory_fake(&format!("{}/views", pgm_dir_path), "pgm_view")
+            .expect("Failed to process views");
+        compiled_content.push_str(&views_content);
+    }
+
+    // Process migrations if directory exists
+    if Path::new(&format!("{}/migrations", pgm_dir_path)).is_dir() {
+        let migrations_content =
+            process_migrations_fake(pgm_dir_path).expect("Failed to process migrations");
+        compiled_content.push_str(&migrations_content);
+    }
 
     // End the main DO block
     compiled_content.push_str("END $pgm$;\n");
