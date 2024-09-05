@@ -1,6 +1,6 @@
+use anyhow::{Context, Result};
 use std::io::{self, Write};
 use std::path::Path;
-use anyhow::{Context, Result};
 
 pub fn create_view(pgm_dir_path: &str, name: &str) -> Result<()> {
     if !Path::new(pgm_dir_path).exists() {
@@ -30,8 +30,7 @@ pub fn create_view(pgm_dir_path: &str, name: &str) -> Result<()> {
         }
     }
 
-    let template = std::fs::read_to_string("./src/commands/create/templates/view.sql")
-        .context("Failed to read view template")?;
+    let template = include_str!("templates/view.sql");
     let content = template.replace("<name_placeholder>", name);
     std::fs::File::create(&file_path).context("Failed to create view file")?;
     std::fs::write(file_path, content).context("Failed to write to view file")?;
