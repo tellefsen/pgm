@@ -177,6 +177,7 @@ fn main() {
                     for cause in e.chain() {
                         eprintln!("  - {}", cause);
                     }
+                    std::process::exit(1);
                 }
             }
         }
@@ -190,6 +191,7 @@ fn main() {
                     for cause in e.chain() {
                         eprintln!("  - {}", cause);
                     }
+                    std::process::exit(1);
                 } else {
                     println!("Migration created successfully");
                 }
@@ -206,6 +208,7 @@ fn main() {
                     for cause in e.chain() {
                         eprintln!("  - {}", cause);
                     }
+                    std::process::exit(1);
                 }
             }
             Some(("view", view_matches)) => {
@@ -221,6 +224,7 @@ fn main() {
                     for cause in e.chain() {
                         eprintln!("  - {}", cause);
                     }
+                    std::process::exit(1);
                 }
             }
             Some(("function", function_matches)) => {
@@ -236,6 +240,7 @@ fn main() {
                     for cause in e.chain() {
                         eprintln!("  - {}", cause);
                     }
+                    std::process::exit(1);
                 }
             }
             Some(("seed", seed_matches)) => {
@@ -247,6 +252,7 @@ fn main() {
                     for cause in e.chain() {
                         eprintln!("  - {}", cause);
                     }
+                    std::process::exit(1);
                 } else {
                     println!("Seed created successfully");
                 }
@@ -262,6 +268,7 @@ fn main() {
                 for cause in e.chain() {
                     eprintln!("  - {}", cause);
                 }
+                std::process::exit(1);
             } else {
                 println!("Database seeded successfully");
             }
