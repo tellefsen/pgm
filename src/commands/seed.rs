@@ -4,9 +4,14 @@ use anyhow::{Context, Result};
 use tempfile::NamedTempFile;
 
 fn process_seed_directory(full_dir_path: &str) -> Result<String> {
+    let mut entries: Vec<_> = std::fs::read_dir(full_dir_path)?
+        .filter_map(|entry| entry.ok())
+        .collect();
+    
+    entries.sort_by_key(|entry| entry.path());
+
     let mut compiled_content = String::new();
-    for entry in std::fs::read_dir(full_dir_path)? {
-        let entry = entry?;
+    for entry in entries {
         let path = entry.path();
         if path.is_file() && path.extension().map_or(false, |ext| ext == "sql") {
             let content = std::fs::read_to_string(&path)?;
